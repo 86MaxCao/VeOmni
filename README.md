@@ -6,10 +6,10 @@
 > | Model | model_type | LLM Backbone | Generation Method | Params |
 > |-------|-----------|-------------|-------------------|--------|
 > | [Bagel](https://github.com/ByteDance-Seed/Bagel) | `bagel` | Qwen2-VL 7B | MoVQGAN (Flow-Matching) | 14.6B |
-> | [ThinkMorph](https://github.com/LLM-ThinkMorph/ThinkMorph) | `thinkmorph` | Qwen2-VL 7B | MoVQGAN (Flow-Matching + CoT) | 14.6B |
-> | [BLIP3o](https://github.com/salesforce/BLIP3o) | `blip3o_qwen` | xGen-MM (Qwen2) | Diffusion (DIT + VAE) | 14.1B |
-> | [SenseNova-U1](https://github.com/SenseNova/SenseNova-U1) | `neo_chat` | Qwen3 8B | Flow-Matching (MoT) | 17.6B |
-> | [LatentUM](https://github.com/LatentUM/LatentUM) | `latentum` | InternVL (Qwen3) | MoT Discrete Tokens (AR Head) | 8.8B |
+> | [ThinkMorph](https://github.com/ThinkMorph/ThinkMorph) | `thinkmorph` | Qwen2-VL 7B | MoVQGAN (Flow-Matching + CoT) | 14.6B |
+> | [BLIP3o](https://github.com/JiuhaiChen/BLIP3o) | `blip3o_qwen` | xGen-MM (Qwen2) | Diffusion (DIT + VAE) | 14.1B |
+> | [SenseNova-U1](https://github.com/OpenSenseNova/SenseNova-U1) | `neo_chat` | Qwen3 8B | Flow-Matching (MoT) | 17.6B |
+> | [LatentUM](https://github.com/SJTU-DENG-Lab/LatentUM) | `latentum` | InternVL (Qwen3) | MoT Discrete Tokens (AR Head) | 8.8B |
 >
 > **Environment:**
 > - GPU: AMD Instinct MI308X (192GB HBM3)
