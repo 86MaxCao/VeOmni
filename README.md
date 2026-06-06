@@ -1,32 +1,32 @@
 
-> **Fork 说明 (AMD ROCm 适配)**
+> **Fork Note (AMD ROCm Adaptation)**
 >
-> 本分支 (`feat/unified-amd`) 在 VeOmni 框架中适配了 **5 个统一多模态模型**（理解 + 生成），用于消融实验论文。
+> This branch (`feat/unified-amd`) adapts **5 unified multimodal models** (understanding + generation) into the VeOmni framework for ablation experiments.
 >
-> | 模型 | model_type | LLM Backbone | 生成方式 | 参数量 |
-> |------|-----------|-------------|---------|-------|
+> | Model | model_type | LLM Backbone | Generation Method | Params |
+> |-------|-----------|-------------|-------------------|--------|
 > | [Bagel](https://github.com/ByteDance-Seed/Bagel) | `bagel` | Qwen2-VL 7B | MoVQGAN (Flow-Matching) | 14.6B |
 > | [ThinkMorph](https://github.com/LLM-ThinkMorph/ThinkMorph) | `thinkmorph` | Qwen2-VL 7B | MoVQGAN (Flow-Matching + CoT) | 14.6B |
 > | [BLIP3o](https://github.com/salesforce/BLIP3o) | `blip3o_qwen` | xGen-MM (Qwen2) | Diffusion (DIT + VAE) | 14.1B |
 > | [SenseNova-U1](https://github.com/SenseNova/SenseNova-U1) | `neo_chat` | Qwen3 8B | Flow-Matching (MoT) | 17.6B |
 > | [LatentUM](https://github.com/LatentUM/LatentUM) | `latentum` | InternVL (Qwen3) | MoT Discrete Tokens (AR Head) | 8.8B |
 >
-> **环境：**
-> - GPU: AMD Instinct MI308X (192GB HBM3) × 8
+> **Environment:**
+> - GPU: AMD Instinct MI308X (192GB HBM3) x 8
 > - Platform: ROCm 7.0 + PyTorch 2.10.0+rocm7.0
 > - Python: 3.11 (micromamba env `amdpy11`)
 > - Flash Attention: flash_attn 2.7.3 (ROCm)
 >
-> **使用：**
+> **Usage:**
 > ```bash
-> # 推理（5 模型统一入口）
+> # Inference (unified entry for all 5 models)
 > python tasks/infer/infer_unified.py --model_type bagel --prompt "Describe this image" --image img.jpg
 >
-> # 训练（SFT）
+> # Training (SFT)
 > torchrun --nproc_per_node=1 tasks/train_unified.py --config configs/multimodal/bagel/sft.yaml
 > ```
 >
-> 详见各分支：`feat/bagel-amd`, `feat/thinkmorph-amd`, `feat/blip3o-amd`, `feat/sensenova-u1-amd`, `feat/latentum-amd`
+> See per-model branches: `feat/bagel-amd`, `feat/thinkmorph-amd`, `feat/blip3o-amd`, `feat/sensenova-u1-amd`, `feat/latentum-amd`
 
 ---
 
