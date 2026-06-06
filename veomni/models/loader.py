@@ -65,6 +65,17 @@ def raise_unsupported_veomni_modeling(model_name: str) -> None:
     )
 
 
+def _infer_model_type_from_config_dict(config_dict: dict) -> str:
+    """Infer model_type from config structure for models lacking a top-level model_type field."""
+    # LatentUM: has internvl_config + mixture_mode at top level
+    if "internvl_config" in config_dict and "mixture_mode" in config_dict:
+        return "latentum"
+    raise KeyError(
+        "Cannot infer model_type from config dict. "
+        "Expected 'model_type' or '_class_name' key, or a recognizable config structure."
+    )
+
+
 def get_model_config(config_path: str, **kwargs):
     modeling_backend = get_env("MODELING_BACKEND")
     if modeling_backend == "hf":
@@ -88,9 +99,14 @@ def get_model_config(config_path: str, **kwargs):
                 return config
         except Exception:  # load from veomni
             config_dict, _ = PretrainedConfig.get_config_dict(config_path, **kwargs)
-            model_type = (
-                config_dict["model_type"] if "model_type" in config_dict else config_dict["_class_name"]
-            )  # diffusers use _class_name
+            if "model_type" in config_dict:
+                model_type = config_dict["model_type"]
+            elif "_class_name" in config_dict:
+                model_type = config_dict["_class_name"]  # diffusers use _class_name
+            else:
+                # Attempt to infer model_type from config structure for models
+                # that don't include a top-level model_type field.
+                model_type = _infer_model_type_from_config_dict(config_dict)
             logger.info_rank0(f"[CONFIG] Loading {model_type} from custom config.")
             kwargs.pop("trust_remote_code", None)
             return MODEL_CONFIG_REGISTRY[model_type]().from_pretrained(config_path, **kwargs)
