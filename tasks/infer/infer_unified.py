@@ -118,7 +118,7 @@ def patchify(img_tensor, patch_size):
     h_patches = H // patch_size
     w_patches = W // patch_size
     patches = img_tensor.reshape(C, h_patches, patch_size, w_patches, patch_size)
-    patches = patches.permute(1, 3, 0, 2, 4).reshape(h_patches * w_patches, C * patch_size * patch_size)
+    patches = patches.permute(1, 3, 2, 4, 0).reshape(h_patches * w_patches, patch_size * patch_size * C)
     return patches
 
 
@@ -139,83 +139,57 @@ def get_flattened_position_ids(H, W, patch_size, max_num_patches_per_side):
 
 @torch.no_grad()
 def infer_bagel_understand(model, config, tokenizer, image: Optional[Image.Image], prompt: str, device: str) -> str:
-    """Bagel/ThinkMorph understanding with packed sequence forward."""
-    bos_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
-    eos_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    """Bagel/ThinkMorph understanding with three-step KV-cache inference."""
+    special_tokens = []
+    existing = []
+    for k, v in tokenizer.special_tokens_map.items():
+        if isinstance(v, str):
+            existing.append(v)
+        elif isinstance(v, list):
+            existing.extend(v)
+    for token in ["<|im_start|>", "<|im_end|>", "<|vision_start|>", "<|vision_end|>"]:
+        if token not in existing:
+            special_tokens.append(token)
+    if special_tokens:
+        tokenizer.add_tokens(special_tokens)
 
-    user_prefix = tokenizer.encode("<|im_start|>user\n", add_special_tokens=False)
-    user_suffix = tokenizer.encode(f"\n{prompt}<|im_end|>\n<|im_start|>assistant\n", add_special_tokens=False)
+    new_token_ids = {
+        "bos_token_id": tokenizer.convert_tokens_to_ids("<|im_start|>"),
+        "eos_token_id": tokenizer.convert_tokens_to_ids("<|im_end|>"),
+        "start_of_image": tokenizer.convert_tokens_to_ids("<|vision_start|>"),
+        "end_of_image": tokenizer.convert_tokens_to_ids("<|vision_end|>"),
+    }
 
-    vit_patch_size = config.vit_config.patch_size
-    max_patches = config.vit_max_num_patch_per_side
+    class _ImageTransform:
+        def __init__(self, max_size, min_size, patch_size):
+            self.max_size = max_size
+            self.min_size = min_size
+            self.patch_size = patch_size
 
-    if image is not None:
-        image = pil_img2rgb(image)
-        image = resize_image(image, 980, 224, 14)
-        img_tensor = torch.tensor(np.array(image)).permute(2, 0, 1).float() / 255.0
-        img_tensor = img_tensor.unsqueeze(0).to(device=device, dtype=torch.bfloat16)
+        def __call__(self, img):
+            w, h = img.size
+            if max(w, h) > self.max_size:
+                scale = self.max_size / max(w, h)
+                w, h = int(w * scale), int(h * scale)
+            if min(w, h) < self.min_size:
+                scale = self.min_size / min(w, h)
+                w, h = int(w * scale), int(h * scale)
+            w = max((w // self.patch_size) * self.patch_size, self.patch_size)
+            h = max((h // self.patch_size) * self.patch_size, self.patch_size)
+            img = img.resize((w, h), Image.LANCZOS)
+            return torch.tensor(np.array(img)).permute(2, 0, 1).float() / 255.0
 
-        H, W = img_tensor.shape[2], img_tensor.shape[3]
-        vit_pos_ids = get_flattened_position_ids(H, W, vit_patch_size, max_patches).to(device)
-        vit_patches = patchify(img_tensor[0], vit_patch_size).to(device)
+    image_transform = _ImageTransform(980, 224, config.vit_config.patch_size)
+    images = [pil_img2rgb(image)] if image is not None else []
 
-        cu_seqlens = torch.tensor([0, vit_patches.shape[0]], dtype=torch.int32, device=device)
-        vit_hidden = model.vit_model(vit_patches, vit_pos_ids, cu_seqlens, vit_patches.shape[0])
-        vit_embed = model.connector(vit_hidden) + model.vit_pos_embed(vit_pos_ids)
-
-        start_tok = tokenizer.convert_tokens_to_ids("<|vision_start|>")
-        end_tok = tokenizer.convert_tokens_to_ids("<|vision_end|>")
-        token_ids = user_prefix + [start_tok] + [0] * vit_embed.shape[0] + [end_tok] + user_suffix
-        vit_start = len(user_prefix) + 1
-        num_vit = vit_embed.shape[0]
-    else:
-        token_ids = user_prefix + user_suffix
-        vit_start = None
-        num_vit = 0
-
-    input_ids = torch.tensor(token_ids, dtype=torch.long, device=device)
-    embeddings = model.language_model.model.embed_tokens(input_ids)
-
-    if vit_start is not None:
-        embeddings[vit_start:vit_start + num_vit] = vit_embed
-
-    seq_len = embeddings.shape[0]
-    sample_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
-    position_ids = torch.arange(seq_len, dtype=torch.long, device=device)
-    und_indexes = torch.arange(seq_len, device=device)
-
-    hidden = model.language_model(
-        packed_sequence=embeddings,
-        sample_lens=sample_lens,
-        attention_mask=None,
-        packed_position_ids=position_ids,
-        packed_und_token_indexes=und_indexes,
-        packed_gen_token_indexes=torch.tensor([], dtype=torch.long, device=device),
+    return model.chat(
+        tokenizer=tokenizer,
+        new_token_ids=new_token_ids,
+        image_transform=image_transform,
+        images=images,
+        prompt=prompt,
+        max_length=512,
     )
-
-    logits = model.language_model.lm_head(hidden[-1:])
-    next_token = torch.argmax(logits[0], dim=-1).item()
-    generated = [next_token]
-
-    for _ in range(511):
-        if next_token == eos_id:
-            break
-        tok_emb = model.language_model.model.embed_tokens(torch.tensor([next_token], device=device))
-        cur_pos = torch.tensor([seq_len + len(generated) - 1], dtype=torch.long, device=device)
-        sample_lens_step = torch.tensor([1], dtype=torch.int32, device=device)
-        h = model.language_model(
-            packed_sequence=tok_emb,
-            sample_lens=sample_lens_step,
-            attention_mask=None,
-            packed_position_ids=cur_pos,
-            packed_und_token_indexes=torch.tensor([0], device=device),
-            packed_gen_token_indexes=torch.tensor([], dtype=torch.long, device=device),
-        )
-        logits = model.language_model.lm_head(h[-1:])
-        next_token = torch.argmax(logits[0], dim=-1).item()
-        generated.append(next_token)
-
-    return tokenizer.decode(generated, skip_special_tokens=True)
 
 
 # =============================================================================

@@ -541,17 +541,29 @@ class Qwen2RotaryEmbedding(nn.Module):
         self.dim = config.hidden_size // config.num_attention_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.base = config.rope_theta
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
+        inv_freq = self._compute_inv_freq()
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def _compute_inv_freq(self):
+        return 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
+
+    def _ensure_inv_freq(self, device):
+        if self.inv_freq is not None and self.inv_freq.abs().max() > 0:
+            return
+        self.inv_freq = self._compute_inv_freq().to(device=device, dtype=self.inv_freq.dtype)
 
     @torch.no_grad()
     def forward(self, x, position_ids):
+        self._ensure_inv_freq(x.device)
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
-        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos()
-        sin = emb.sin()
+        device_type = x.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
@@ -573,6 +585,28 @@ class Qwen2MLP(nn.Module):
 
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+class NaiveCache:
+    def __init__(self, num_layers):
+        self.key_cache = {k: None for k in range(num_layers)}
+        self.value_cache = {k: None for k in range(num_layers)}
+
+    @property
+    def num_layers(self):
+        return len(self.key_cache)
+
+    @property
+    def seq_lens(self):
+        if self.key_cache[0] is not None:
+            return self.key_cache[0].shape[0]
+        return 0
+
+
+@dataclass
+class BaseNavitOutputWithPast(ModelOutput):
+    packed_query_sequence: torch.FloatTensor = None
+    past_key_values: Optional[NaiveCache] = None
 
 
 class PackedAttention(nn.Module):
@@ -652,6 +686,75 @@ class PackedAttention(nn.Module):
 
         attn_output = attn_output.reshape(-1, self.hidden_size)
         return self.o_proj(attn_output)
+
+    def forward_inference(
+        self,
+        packed_query_sequence,
+        query_lens,
+        packed_query_position_embeddings,
+        packed_query_indexes,
+        past_key_values=None,
+        key_values_lens=None,
+        packed_key_value_indexes=None,
+        update_past_key_values=True,
+        is_causal=True,
+    ):
+        from flash_attn import flash_attn_varlen_func
+
+        packed_query_states = self.q_proj(packed_query_sequence).view(-1, self.num_heads, self.head_dim)
+        packed_key_states = self.k_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
+        packed_value_states = self.v_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
+
+        packed_query_states = self.q_norm(packed_query_states)
+        packed_key_states = self.k_norm(packed_key_states)
+
+        cos, sin = packed_query_position_embeddings
+        packed_query_states, packed_key_states = _apply_rotary_pos_emb(
+            packed_query_states, packed_key_states, cos, sin
+        )
+
+        packed_query_states = packed_query_states.to(torch.bfloat16)
+        packed_key_states = packed_key_states.to(torch.bfloat16)
+        packed_value_states = packed_value_states.to(torch.bfloat16)
+
+        if past_key_values is not None and past_key_values.key_cache[self.layer_idx] is not None:
+            past_key_states = past_key_values.key_cache[self.layer_idx]
+            past_value_states = past_key_values.value_cache[self.layer_idx]
+
+            seqlens = sum(query_lens) + sum(key_values_lens)
+            merged_key_states = past_key_states.new_zeros((seqlens, self.num_key_value_heads, self.head_dim))
+            merged_value_states = past_key_states.new_zeros((seqlens, self.num_key_value_heads, self.head_dim))
+            merged_key_states[packed_query_indexes] = packed_key_states
+            merged_key_states[packed_key_value_indexes] = past_key_states
+            merged_value_states[packed_query_indexes] = packed_value_states
+            merged_value_states[packed_key_value_indexes] = past_value_states
+            key_values_lens = key_values_lens + query_lens
+        else:
+            merged_key_states = packed_key_states
+            merged_value_states = packed_value_states
+            key_values_lens = query_lens
+
+        cu_seqlens_q = F.pad(torch.cumsum(query_lens, dim=0), (1, 0)).to(torch.int32)
+        cu_seqlens_k = F.pad(torch.cumsum(key_values_lens, dim=0), (1, 0)).to(torch.int32)
+
+        attn_output = flash_attn_varlen_func(
+            q=packed_query_states,
+            k=merged_key_states,
+            v=merged_value_states,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max(query_lens).item(),
+            max_seqlen_k=max(key_values_lens).item(),
+            causal=is_causal,
+        )
+        attn_output = attn_output.reshape(-1, self.hidden_size)
+        attn_output = self.o_proj(attn_output)
+
+        if update_past_key_values:
+            past_key_values.key_cache[self.layer_idx] = merged_key_states
+            past_key_values.value_cache[self.layer_idx] = merged_value_states
+
+        return attn_output, past_key_values
 
 
 class PackedAttentionMoT(nn.Module):
@@ -768,6 +871,108 @@ class PackedAttentionMoT(nn.Module):
         output[packed_gen_token_indexes] = self.o_proj_moe_gen(attn_output[packed_gen_token_indexes])
         return output
 
+    def forward_inference(
+        self,
+        packed_query_sequence,
+        query_lens,
+        packed_query_position_embeddings,
+        packed_query_indexes,
+        past_key_values=None,
+        key_values_lens=None,
+        packed_key_value_indexes=None,
+        update_past_key_values=True,
+        is_causal=True,
+        mode="und",
+        packed_vae_token_indexes=None,
+        packed_text_indexes=None,
+    ):
+        from flash_attn import flash_attn_varlen_func
+
+        if mode == "und":
+            packed_query_states = self.q_proj(packed_query_sequence).view(-1, self.num_heads, self.head_dim)
+            packed_key_states = self.k_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
+            packed_value_states = self.v_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
+            packed_query_states = self.q_norm(packed_query_states)
+            packed_key_states = self.k_norm(packed_key_states)
+        elif mode == "gen":
+            packed_query_sequence = packed_query_sequence.to(torch.bfloat16)
+            packed_query_states = packed_query_sequence.new_zeros((packed_query_sequence.shape[0], self.num_heads * self.head_dim))
+            packed_key_states = packed_query_sequence.new_zeros((packed_query_sequence.shape[0], self.num_key_value_heads * self.head_dim))
+            packed_value_states = packed_query_sequence.new_zeros((packed_query_sequence.shape[0], self.num_key_value_heads * self.head_dim))
+
+            packed_text_seq = packed_query_sequence[packed_text_indexes]
+            packed_vae_seq = packed_query_sequence[packed_vae_token_indexes]
+
+            packed_query_states[packed_text_indexes] = self.q_proj(packed_text_seq)
+            packed_query_states[packed_vae_token_indexes] = self.q_proj_moe_gen(packed_vae_seq)
+            packed_key_states[packed_text_indexes] = self.k_proj(packed_text_seq)
+            packed_key_states[packed_vae_token_indexes] = self.k_proj_moe_gen(packed_vae_seq)
+            packed_value_states[packed_text_indexes] = self.v_proj(packed_text_seq)
+            packed_value_states[packed_vae_token_indexes] = self.v_proj_moe_gen(packed_vae_seq)
+
+            packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
+            packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
+            packed_value_states = packed_value_states.view(-1, self.num_key_value_heads, self.head_dim)
+
+            packed_query_states = packed_query_states.to(torch.float32)
+            packed_query_states[packed_text_indexes] = self.q_norm(packed_query_states[packed_text_indexes])
+            packed_query_states[packed_vae_token_indexes] = self.q_norm_moe_gen(packed_query_states[packed_vae_token_indexes])
+            packed_key_states = packed_key_states.to(torch.float32)
+            packed_key_states[packed_text_indexes] = self.k_norm(packed_key_states[packed_text_indexes])
+            packed_key_states[packed_vae_token_indexes] = self.k_norm_moe_gen(packed_key_states[packed_vae_token_indexes])
+
+        cos, sin = packed_query_position_embeddings
+        packed_query_states, packed_key_states = _apply_rotary_pos_emb(
+            packed_query_states, packed_key_states, cos, sin
+        )
+
+        packed_query_states = packed_query_states.to(torch.bfloat16)
+        packed_key_states = packed_key_states.to(torch.bfloat16)
+        packed_value_states = packed_value_states.to(torch.bfloat16)
+
+        if past_key_values is not None and past_key_values.key_cache[self.layer_idx] is not None:
+            past_key_states = past_key_values.key_cache[self.layer_idx]
+            past_value_states = past_key_values.value_cache[self.layer_idx]
+
+            seqlens = sum(query_lens) + sum(key_values_lens)
+            merged_key_states = past_key_states.new_zeros((seqlens, self.num_key_value_heads, self.head_dim))
+            merged_value_states = past_key_states.new_zeros((seqlens, self.num_key_value_heads, self.head_dim))
+            merged_key_states[packed_query_indexes] = packed_key_states
+            merged_key_states[packed_key_value_indexes] = past_key_states
+            merged_value_states[packed_query_indexes] = packed_value_states
+            merged_value_states[packed_key_value_indexes] = past_value_states
+            key_values_lens = key_values_lens + query_lens
+        else:
+            merged_key_states = packed_key_states
+            merged_value_states = packed_value_states
+            key_values_lens = query_lens
+
+        cu_seqlens_q = F.pad(torch.cumsum(query_lens, dim=0), (1, 0)).to(torch.int32)
+        cu_seqlens_k = F.pad(torch.cumsum(key_values_lens, dim=0), (1, 0)).to(torch.int32)
+
+        attn_output = flash_attn_varlen_func(
+            q=packed_query_states,
+            k=merged_key_states,
+            v=merged_value_states,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max(query_lens).item(),
+            max_seqlen_k=max(key_values_lens).item(),
+            causal=is_causal,
+        )
+        attn_output = attn_output.reshape(-1, self.hidden_size)
+        if mode == "und":
+            attn_output = self.o_proj(attn_output)
+        elif mode == "gen":
+            attn_output[packed_text_indexes] = self.o_proj(attn_output[packed_text_indexes])
+            attn_output[packed_vae_token_indexes] = self.o_proj_moe_gen(attn_output[packed_vae_token_indexes])
+
+        if update_past_key_values:
+            past_key_values.key_cache[self.layer_idx] = merged_key_states
+            past_key_values.value_cache[self.layer_idx] = merged_value_states
+
+        return attn_output, past_key_values
+
 
 class Qwen2DecoderLayer(nn.Module):
     def __init__(self, config: BagelLLMConfig, layer_idx: int):
@@ -786,6 +991,41 @@ class Qwen2DecoderLayer(nn.Module):
         residual = packed_sequence
         packed_sequence = self.mlp(self.post_attention_layernorm(packed_sequence))
         return residual + packed_sequence
+
+    def forward_inference(
+        self,
+        packed_query_sequence,
+        query_lens,
+        packed_query_position_embeddings,
+        packed_query_indexes,
+        past_key_values=None,
+        key_values_lens=None,
+        packed_key_value_indexes=None,
+        update_past_key_values=True,
+        is_causal=True,
+        **kwargs,
+    ):
+        residual = packed_query_sequence
+        packed_query_sequence = self.input_layernorm(packed_query_sequence)
+
+        packed_query_sequence, past_key_values = self.self_attn.forward_inference(
+            packed_query_sequence=packed_query_sequence,
+            query_lens=query_lens,
+            packed_query_position_embeddings=packed_query_position_embeddings,
+            packed_query_indexes=packed_query_indexes,
+            past_key_values=past_key_values,
+            key_values_lens=key_values_lens,
+            packed_key_value_indexes=packed_key_value_indexes,
+            update_past_key_values=update_past_key_values,
+            is_causal=is_causal,
+        )
+        packed_query_sequence = residual + packed_query_sequence
+
+        residual = packed_query_sequence
+        packed_query_sequence = self.mlp(self.post_attention_layernorm(packed_query_sequence))
+        packed_query_sequence = residual + packed_query_sequence
+
+        return packed_query_sequence, past_key_values
 
 
 class Qwen2MoTDecoderLayer(nn.Module):
@@ -828,6 +1068,62 @@ class Qwen2MoTDecoderLayer(nn.Module):
             self.post_attention_layernorm_moe_gen(packed_sequence[packed_gen_token_indexes])
         )
         return residual + mlp_out
+
+    def forward_inference(
+        self,
+        packed_query_sequence,
+        query_lens,
+        packed_query_position_embeddings,
+        packed_query_indexes,
+        past_key_values=None,
+        key_values_lens=None,
+        packed_key_value_indexes=None,
+        update_past_key_values=True,
+        is_causal=True,
+        mode="und",
+        packed_vae_token_indexes=None,
+        packed_text_indexes=None,
+    ):
+        residual = packed_query_sequence
+        if mode == "und":
+            packed_query_sequence = self.input_layernorm(packed_query_sequence)
+        elif mode == "gen":
+            normed = torch.zeros_like(packed_query_sequence)
+            normed[packed_text_indexes] = self.input_layernorm(packed_query_sequence[packed_text_indexes])
+            normed[packed_vae_token_indexes] = self.input_layernorm_moe_gen(packed_query_sequence[packed_vae_token_indexes])
+            packed_query_sequence = normed
+
+        packed_query_sequence, past_key_values = self.self_attn.forward_inference(
+            packed_query_sequence=packed_query_sequence,
+            query_lens=query_lens,
+            packed_query_position_embeddings=packed_query_position_embeddings,
+            packed_query_indexes=packed_query_indexes,
+            past_key_values=past_key_values,
+            key_values_lens=key_values_lens,
+            packed_key_value_indexes=packed_key_value_indexes,
+            update_past_key_values=update_past_key_values,
+            is_causal=is_causal,
+            mode=mode,
+            packed_vae_token_indexes=packed_vae_token_indexes,
+            packed_text_indexes=packed_text_indexes,
+        )
+        packed_query_sequence = residual + packed_query_sequence
+
+        residual = packed_query_sequence
+        if mode == "und":
+            packed_query_sequence = self.mlp(self.post_attention_layernorm(packed_query_sequence))
+        elif mode == "gen":
+            mlp_out = torch.zeros_like(packed_query_sequence).to(torch.bfloat16)
+            mlp_out[packed_text_indexes] = self.mlp(
+                self.post_attention_layernorm(packed_query_sequence[packed_text_indexes]).to(torch.bfloat16)
+            )
+            mlp_out[packed_vae_token_indexes] = self.mlp_moe_gen(
+                self.post_attention_layernorm_moe_gen(packed_query_sequence[packed_vae_token_indexes]).to(torch.bfloat16)
+            )
+            packed_query_sequence = mlp_out
+        packed_query_sequence = residual + packed_query_sequence
+
+        return packed_query_sequence, past_key_values
 
 
 _DECODER_LAYER_DICT = {
@@ -883,6 +1179,63 @@ class Qwen2Model(nn.Module):
             return out
         return self.norm(packed_sequence)
 
+    def forward_inference(
+        self,
+        packed_query_sequence,
+        query_lens,
+        packed_query_position_ids,
+        packed_query_indexes,
+        past_key_values=None,
+        key_values_lens=None,
+        packed_key_value_indexes=None,
+        update_past_key_values=True,
+        is_causal=True,
+        mode="und",
+        packed_vae_token_indexes=None,
+        packed_text_indexes=None,
+    ):
+        cos, sin = self.rotary_emb(packed_query_sequence, packed_query_position_ids.unsqueeze(0))
+        cos, sin = cos.squeeze(0), sin.squeeze(0)
+        packed_query_position_embeddings = (cos, sin)
+
+        extra = {}
+        if self.use_moe:
+            extra = dict(
+                mode=mode,
+                packed_vae_token_indexes=packed_vae_token_indexes,
+                packed_text_indexes=packed_text_indexes,
+            )
+
+        for layer in self.layers:
+            packed_query_sequence, past_key_values = layer.forward_inference(
+                packed_query_sequence=packed_query_sequence,
+                query_lens=query_lens,
+                packed_query_position_embeddings=packed_query_position_embeddings,
+                packed_query_indexes=packed_query_indexes,
+                past_key_values=past_key_values,
+                key_values_lens=key_values_lens,
+                packed_key_value_indexes=packed_key_value_indexes,
+                update_past_key_values=update_past_key_values,
+                is_causal=is_causal,
+                **extra,
+            )
+
+        if self.use_moe:
+            if mode == "und":
+                packed_query_sequence = self.norm(packed_query_sequence)
+            elif mode == "gen":
+                out = torch.zeros_like(packed_query_sequence)
+                out[packed_text_indexes] = self.norm(packed_query_sequence[packed_text_indexes])
+                out[packed_vae_token_indexes] = self.norm_moe_gen(packed_query_sequence[packed_vae_token_indexes])
+                packed_query_sequence = out
+        else:
+            packed_query_sequence = self.norm(packed_query_sequence)
+
+        return BaseNavitOutputWithPast(
+            packed_query_sequence=packed_query_sequence,
+            past_key_values=past_key_values,
+        )
+
 
 class Qwen2ForCausalLM(nn.Module):
     def __init__(self, config: BagelLLMConfig):
@@ -898,6 +1251,36 @@ class Qwen2ForCausalLM(nn.Module):
 
     def forward(self, packed_sequence, sample_lens, attention_mask, packed_position_ids, **kwargs):
         return self.model(packed_sequence, sample_lens, attention_mask, packed_position_ids, **kwargs)
+
+    def forward_inference(
+        self,
+        packed_query_sequence,
+        query_lens,
+        packed_query_position_ids,
+        packed_query_indexes,
+        past_key_values=None,
+        key_values_lens=None,
+        packed_key_value_indexes=None,
+        update_past_key_values=True,
+        is_causal=True,
+        mode="und",
+        packed_vae_token_indexes=None,
+        packed_text_indexes=None,
+    ):
+        return self.model.forward_inference(
+            packed_query_sequence=packed_query_sequence,
+            query_lens=query_lens,
+            packed_query_position_ids=packed_query_position_ids,
+            packed_query_indexes=packed_query_indexes,
+            past_key_values=past_key_values,
+            key_values_lens=key_values_lens,
+            packed_key_value_indexes=packed_key_value_indexes,
+            update_past_key_values=update_past_key_values,
+            is_causal=is_causal,
+            mode=mode,
+            packed_vae_token_indexes=packed_vae_token_indexes,
+            packed_text_indexes=packed_text_indexes,
+        )
 
 
 # =============================================================================
@@ -1068,6 +1451,352 @@ class BagelForConditionalGeneration(PreTrainedModel):
                 loss = loss + ce_loss
 
         return BagelOutput(loss=loss, mse_loss=mse_loss, ce_loss=ce_loss)
+
+    # =========================================================================
+    # Three-step KV-cache inference methods
+    # =========================================================================
+
+    def _patchify(self, image_tensor, patch_size):
+        c, h, w = image_tensor.shape
+        p = patch_size
+        image_tensor = image_tensor.reshape(c, h // p, p, w // p, p)
+        image_tensor = image_tensor.permute(1, 3, 2, 4, 0).reshape(-1, p * p * c)
+        return image_tensor
+
+    def prepare_vit_images(self, curr_kvlens, curr_rope, images, transforms, new_token_ids):
+        packed_vit_token_indexes = []
+        vit_token_seqlens, packed_vit_tokens, packed_vit_position_ids = [], [], []
+        packed_text_ids, packed_text_indexes = [], []
+        packed_seqlens, packed_position_ids, packed_indexes = [], [], []
+        packed_key_value_indexes = []
+
+        _curr = curr = 0
+        newlens, new_rope = [], []
+        for image, curr_kvlen, curr_position_id in zip(images, curr_kvlens, curr_rope):
+            packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
+            curr += curr_kvlen
+
+            packed_text_ids.append(new_token_ids["start_of_image"])
+            packed_text_indexes.append(_curr)
+            packed_indexes.append(curr)
+            curr += 1
+            _curr += 1
+
+            image_tensor = transforms(image)
+            vit_position_ids = self.get_flattened_position_ids(
+                image_tensor.size(1), image_tensor.size(2),
+                self.vit_patch_size,
+                max_num_patches_per_side=self.vit_max_num_patch_per_side,
+            )
+            vit_tokens = self._patchify(image_tensor, self.vit_patch_size)
+            packed_vit_tokens.append(vit_tokens)
+            num_img_tokens = vit_tokens.shape[0]
+            packed_vit_position_ids.append(vit_position_ids)
+            vit_token_seqlens.append(num_img_tokens)
+            packed_vit_token_indexes.extend(range(_curr, _curr + num_img_tokens))
+            packed_indexes.extend(range(curr, curr + num_img_tokens))
+            curr += num_img_tokens
+            _curr += num_img_tokens
+
+            packed_text_ids.append(new_token_ids["end_of_image"])
+            packed_text_indexes.append(_curr)
+            packed_indexes.append(curr)
+            curr += 1
+            _curr += 1
+
+            packed_position_ids.extend([curr_position_id] * (num_img_tokens + 2))
+            packed_seqlens.append(num_img_tokens + 2)
+            newlens.append(curr_kvlen + num_img_tokens + 2)
+            new_rope.append(curr_position_id + 1)
+
+        generation_input = {
+            "packed_text_ids": torch.tensor(packed_text_ids, dtype=torch.long),
+            "packed_text_indexes": torch.tensor(packed_text_indexes, dtype=torch.long),
+            "vit_token_seqlens": torch.tensor(vit_token_seqlens, dtype=torch.int),
+            "packed_vit_tokens": torch.cat(packed_vit_tokens, dim=0),
+            "packed_vit_position_ids": torch.cat(packed_vit_position_ids, dim=0),
+            "packed_vit_token_indexes": torch.tensor(packed_vit_token_indexes, dtype=torch.long),
+            "packed_position_ids": torch.tensor(packed_position_ids, dtype=torch.long),
+            "packed_seqlens": torch.tensor(packed_seqlens, dtype=torch.int),
+            "packed_indexes": torch.tensor(packed_indexes, dtype=torch.long),
+            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
+            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
+        }
+        return generation_input, newlens, new_rope
+
+    @torch.no_grad()
+    def forward_cache_update_vit(
+        self,
+        past_key_values,
+        packed_text_ids,
+        packed_text_indexes,
+        packed_vit_tokens,
+        packed_vit_token_indexes,
+        packed_vit_position_ids,
+        vit_token_seqlens,
+        packed_position_ids,
+        packed_seqlens,
+        packed_indexes,
+        packed_key_value_indexes,
+        key_values_lens,
+    ):
+        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
+        packed_sequence[packed_text_indexes] = packed_text_embedding
+
+        cu_seqlens = F.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0)).to(torch.int32)
+        max_seqlen = torch.max(vit_token_seqlens).item()
+        packed_vit_token_embed = self.vit_model(
+            packed_pixel_values=packed_vit_tokens,
+            packed_flattened_position_ids=packed_vit_position_ids,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+        packed_vit_token_embed = self.connector(packed_vit_token_embed)
+        pos_emb = self.vit_pos_embed(packed_vit_position_ids)
+        packed_vit_token_embed = packed_vit_token_embed + pos_emb
+        if packed_vit_token_embed.dtype != packed_sequence.dtype:
+            packed_vit_token_embed = packed_vit_token_embed.to(packed_sequence.dtype)
+        packed_sequence[packed_vit_token_indexes] = packed_vit_token_embed
+
+        extra_inputs = {}
+        if self.use_moe:
+            extra_inputs = {"mode": "und"}
+
+        output = self.language_model.forward_inference(
+            packed_query_sequence=packed_sequence,
+            query_lens=packed_seqlens,
+            packed_query_position_ids=packed_position_ids,
+            packed_query_indexes=packed_indexes,
+            past_key_values=past_key_values,
+            packed_key_value_indexes=packed_key_value_indexes,
+            key_values_lens=key_values_lens,
+            update_past_key_values=True,
+            is_causal=False,
+            **extra_inputs,
+        )
+        return output.past_key_values
+
+    def prepare_prompts(self, curr_kvlens, curr_rope, prompts, tokenizer, new_token_ids):
+        packed_text_ids = []
+        packed_text_position_ids = []
+        text_token_lens = []
+        packed_text_indexes = []
+        packed_key_value_indexes = []
+
+        curr = 0
+        newlens, new_rope_out = [], []
+        for prompt, curr_kvlen, curr_position_id in zip(prompts, curr_kvlens, curr_rope):
+            packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
+            curr += curr_kvlen
+
+            text_ids = tokenizer.encode(prompt)
+            text_ids = [new_token_ids["bos_token_id"]] + text_ids + [new_token_ids["eos_token_id"]]
+            text_token_lens.append(len(text_ids))
+            packed_text_ids.extend(text_ids)
+            packed_text_position_ids.extend(range(curr_position_id, curr_position_id + len(text_ids)))
+            packed_text_indexes.extend(range(curr, curr + len(text_ids)))
+            newlens.append(curr_kvlen + len(text_ids))
+            new_rope_out.append(curr_position_id + len(text_ids))
+            curr += len(text_ids)
+
+        generation_input = {
+            "text_token_lens": torch.tensor(text_token_lens, dtype=torch.int),
+            "packed_text_ids": torch.tensor(packed_text_ids, dtype=torch.long),
+            "packed_text_position_ids": torch.tensor(packed_text_position_ids, dtype=torch.long),
+            "packed_text_indexes": torch.tensor(packed_text_indexes, dtype=torch.long),
+            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
+            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
+        }
+        return generation_input, newlens, new_rope_out
+
+    @torch.no_grad()
+    def forward_cache_update_text(
+        self,
+        past_key_values,
+        packed_text_ids,
+        packed_text_position_ids,
+        text_token_lens,
+        packed_text_indexes,
+        packed_key_value_indexes,
+        key_values_lens,
+    ):
+        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+
+        extra_inputs = {}
+        if self.use_moe:
+            extra_inputs = {"mode": "und"}
+
+        output = self.language_model.forward_inference(
+            packed_query_sequence=packed_text_embedding,
+            query_lens=text_token_lens,
+            packed_query_position_ids=packed_text_position_ids,
+            packed_query_indexes=packed_text_indexes,
+            past_key_values=past_key_values,
+            packed_key_value_indexes=packed_key_value_indexes,
+            key_values_lens=key_values_lens,
+            update_past_key_values=True,
+            is_causal=True,
+            **extra_inputs,
+        )
+        return output.past_key_values
+
+    def prepare_start_tokens(self, curr_kvlens, curr_rope, new_token_ids):
+        packed_start_tokens, packed_key_value_indexes = [], []
+        packed_query_position_ids = []
+
+        curr = 0
+        for curr_kvlen, curr_position_id in zip(curr_kvlens, curr_rope):
+            packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
+            packed_start_tokens.append(new_token_ids["bos_token_id"])
+            packed_query_position_ids.append(curr_position_id)
+            curr += curr_kvlen
+
+        return {
+            "packed_start_tokens": torch.tensor(packed_start_tokens, dtype=torch.long),
+            "packed_query_position_ids": torch.tensor(packed_query_position_ids, dtype=torch.long),
+            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
+            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
+        }
+
+    @torch.no_grad()
+    def generate_text(
+        self,
+        past_key_values,
+        packed_key_value_indexes,
+        key_values_lens,
+        packed_start_tokens,
+        packed_query_position_ids,
+        max_length,
+        do_sample=False,
+        temperature=1.0,
+        end_token_id=None,
+    ):
+        step = 0
+        generated_sequence = []
+        curr_tokens = packed_start_tokens
+        while step < max_length:
+            generated_sequence.append(curr_tokens)
+            packed_text_embedding = self.language_model.model.embed_tokens(curr_tokens)
+            query_lens = torch.ones_like(curr_tokens)
+            packed_query_indexes = torch.cumsum(key_values_lens, dim=0) + torch.arange(
+                0, len(key_values_lens),
+                device=key_values_lens.device,
+                dtype=key_values_lens.dtype,
+            )
+
+            uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
+            for i in range(len(uppacked)):
+                uppacked[i] = uppacked[i] + i
+            packed_key_value_indexes = torch.cat(uppacked, dim=0)
+
+            extra_inputs = {}
+            if self.use_moe:
+                extra_inputs = {"mode": "und"}
+
+            output = self.language_model.forward_inference(
+                packed_query_sequence=packed_text_embedding,
+                query_lens=query_lens,
+                packed_query_position_ids=packed_query_position_ids,
+                packed_query_indexes=packed_query_indexes,
+                past_key_values=past_key_values,
+                key_values_lens=key_values_lens,
+                packed_key_value_indexes=packed_key_value_indexes,
+                update_past_key_values=True,
+                is_causal=True,
+                **extra_inputs,
+            )
+            past_key_values = output.past_key_values
+            pred_logits = self.language_model.lm_head(output.packed_query_sequence)
+
+            if do_sample:
+                probs = F.softmax(pred_logits / temperature, dim=-1)
+                curr_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                curr_tokens = torch.argmax(pred_logits, dim=-1)
+
+            uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
+            for i in range(len(uppacked)):
+                uppacked[i] = torch.cat(
+                    [uppacked[i], torch.tensor([uppacked[i][-1] + 1], device=uppacked[i].device)], dim=0
+                )
+            packed_key_value_indexes = torch.cat(uppacked, dim=0)
+            key_values_lens = key_values_lens + 1
+            packed_query_position_ids = packed_query_position_ids + 1
+            step += 1
+
+            if end_token_id is not None and curr_tokens[0] == end_token_id:
+                break
+
+        output_device = generated_sequence[0].device
+        return torch.stack([i.to(output_device) for i in generated_sequence], dim=0)
+
+    @torch.no_grad()
+    def chat(
+        self,
+        tokenizer,
+        new_token_ids,
+        image_transform,
+        images,
+        prompt,
+        max_length=512,
+        do_sample=False,
+        temperature=1.0,
+    ):
+        device = next(self.parameters()).device
+
+        if isinstance(new_token_ids, dict):
+            for k, v in new_token_ids.items():
+                if torch.is_tensor(v):
+                    new_token_ids[k] = v.to(device)
+
+        past_key_values = NaiveCache(self.config.llm_config.num_hidden_layers)
+        newlens = [0]
+        new_rope = [0]
+
+        for image in images:
+            generation_input, newlens, new_rope = self.prepare_vit_images(
+                curr_kvlens=newlens,
+                curr_rope=new_rope,
+                images=[image],
+                transforms=image_transform,
+                new_token_ids=new_token_ids,
+            )
+            for k, v in generation_input.items():
+                if torch.is_tensor(v):
+                    generation_input[k] = v.to(device)
+            with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+                past_key_values = self.forward_cache_update_vit(past_key_values, **generation_input)
+
+        generation_input, newlens, new_rope = self.prepare_prompts(
+            curr_kvlens=newlens,
+            curr_rope=new_rope,
+            prompts=[prompt],
+            tokenizer=tokenizer,
+            new_token_ids=new_token_ids,
+        )
+        for k, v in generation_input.items():
+            if torch.is_tensor(v):
+                generation_input[k] = v.to(device)
+        with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+            past_key_values = self.forward_cache_update_text(past_key_values, **generation_input)
+
+        generation_input = self.prepare_start_tokens(newlens, new_rope, new_token_ids)
+        for k, v in generation_input.items():
+            if torch.is_tensor(v):
+                generation_input[k] = v.to(device)
+        with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+            unpacked_latent = self.generate_text(
+                past_key_values=past_key_values,
+                max_length=max_length,
+                do_sample=do_sample,
+                temperature=temperature,
+                end_token_id=new_token_ids["eos_token_id"],
+                **generation_input,
+            )
+        output = tokenizer.decode(unpacked_latent[:, 0])
+        output = output.split("<|im_end|>")[0].split("<|im_start|>")[1]
+        return output
 
 
 # =============================================================================
