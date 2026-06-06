@@ -12,9 +12,9 @@
 > | [LatentUM](https://github.com/LatentUM/LatentUM) | `latentum` | InternVL (Qwen3) | MoT Discrete Tokens (AR Head) | 8.8B |
 >
 > **Environment:**
-> - GPU: AMD Instinct MI308X (192GB HBM3) x 8
+> - GPU: AMD Instinct MI308X (192GB HBM3)
 > - Platform: ROCm 7.0 + PyTorch 2.10.0+rocm7.0
-> - Python: 3.11 (micromamba env `amdpy11`)
+> - Python: 3.11
 > - Flash Attention: flash_attn 2.7.3 (ROCm)
 >
 > **Usage:**
