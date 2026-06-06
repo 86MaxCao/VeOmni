@@ -65,6 +65,26 @@ def raise_unsupported_veomni_modeling(model_name: str) -> None:
     )
 
 
+def _infer_model_type_from_config_dict(config_dict: dict, config_path: str) -> str:
+    """Infer model_type from config_dict, handling non-standard configs."""
+    import os
+
+    if "model_type" in config_dict:
+        return config_dict["model_type"]
+    if "_class_name" in config_dict:
+        return config_dict["_class_name"]
+    # ThinkMorph: config.json has {"name": ["BAGEL-7B-MoT"]} + separate llm_config.json
+    if "name" in config_dict and os.path.isfile(os.path.join(config_path, "llm_config.json")):
+        return "thinkmorph"
+    # LatentUM: has internvl_config + mixture_mode
+    if "internvl_config" in config_dict and "mixture_mode" in config_dict:
+        return "latentum"
+    raise ValueError(
+        f"Cannot infer model_type from config at {config_path}. "
+        f"Available keys: {list(config_dict.keys())}"
+    )
+
+
 def get_model_config(config_path: str, **kwargs):
     modeling_backend = get_env("MODELING_BACKEND")
     if modeling_backend == "hf":
@@ -87,10 +107,25 @@ def get_model_config(config_path: str, **kwargs):
                 )
                 return config
         except Exception:  # load from veomni
-            config_dict, _ = PretrainedConfig.get_config_dict(config_path, **kwargs)
-            model_type = (
-                config_dict["model_type"] if "model_type" in config_dict else config_dict["_class_name"]
-            )  # diffusers use _class_name
+            import json
+            import os
+
+            try:
+                config_dict, _ = PretrainedConfig.get_config_dict(config_path, **kwargs)
+            except Exception:
+                # Handle malformed config.json (e.g. ThinkMorph with trailing comma)
+                config_json = os.path.join(config_path, "config.json")
+                try:
+                    with open(config_json) as f:
+                        content = f.read().rstrip().rstrip(",").rstrip()
+                        # Fix trailing commas in JSON
+                        import re
+                        content = re.sub(r',\s*}', '}', content)
+                        content = re.sub(r',\s*]', ']', content)
+                        config_dict = json.loads(content)
+                except Exception:
+                    config_dict = {}
+            model_type = _infer_model_type_from_config_dict(config_dict, config_path)
             logger.info_rank0(f"[CONFIG] Loading {model_type} from custom config.")
             kwargs.pop("trust_remote_code", None)
             return MODEL_CONFIG_REGISTRY[model_type]().from_pretrained(config_path, **kwargs)
