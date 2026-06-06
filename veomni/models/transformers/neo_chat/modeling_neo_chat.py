@@ -843,6 +843,112 @@ class NEOChatModel(PreTrainedModel):
         else:
             return self.vision_model(pixel_values=pixel_values, grid_hw=grid_hw).last_hidden_state
 
-    def forward(self, pixel_values=None, input_ids=None, attention_mask=None, labels=None, **kwargs):
-        """Forward pass (placeholder - training logic not implemented yet)."""
-        raise NotImplementedError("Training forward pass not yet implemented for VeOmni integration.")
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        labels=None,
+        pixel_values=None,
+        image_gen_indicators=None,
+        indexes=None,
+        gen_pixel_values=None,
+        timesteps=None,
+        gen_grid_hw=None,
+        grid_hw=None,
+        **kwargs,
+    ):
+        """Training forward pass for SenseNova-U1.
+
+        Supports three modes depending on inputs:
+        1. Understanding only: input_ids + labels (+ optional pixel_values for VQA)
+        2. Generation only: input_ids + gen_pixel_values + timesteps
+        3. Mixed: both understanding and generation tokens in same batch
+
+        Returns ModelOutput with .loss for VeOmni trainer compatibility.
+        """
+        device = input_ids.device if input_ids is not None else next(self.parameters()).device
+        batch_size = input_ids.shape[0] if input_ids is not None else 1
+        seq_len = input_ids.shape[1] if input_ids is not None else 0
+
+        # Build 3D position IDs (t, h, w) if not provided
+        # indexes shape: [3, S] where row 0=temporal, 1=h, 2=w
+        # For text-only: t = sequential positions, h = 0, w = 0
+        if indexes is None:
+            t_ids = torch.arange(seq_len, device=device)
+            h_ids = torch.zeros(seq_len, dtype=torch.long, device=device)
+            w_ids = torch.zeros(seq_len, dtype=torch.long, device=device)
+            indexes = torch.stack([t_ids, h_ids, w_ids], dim=0)  # [3, S]
+
+        # Embed input tokens
+        inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+
+        # Process understanding images (ViT features injected into sequence)
+        if pixel_values is not None:
+            vit_features = self.extract_feature(pixel_values, gen_model=False, grid_hw=grid_hw)
+
+        # Process generation images (noisy target for flow-matching loss)
+        fm_loss = None
+        noise = None
+        gen_features = None
+        if gen_pixel_values is not None and timesteps is not None and image_gen_indicators is not None:
+            gen_features = self.extract_feature(gen_pixel_values, gen_model=True, grid_hw=gen_grid_hw)
+
+            t_emb = self.fm_modules["timestep_embedder"](timesteps)
+
+            noise = torch.randn_like(gen_features)
+            t = timesteps.view(-1, 1, 1) if timesteps.dim() == 1 else timesteps
+            noisy_features = (1 - t) * gen_features + t * noise
+
+            gen_mask = image_gen_indicators.bool()
+            if gen_mask.any():
+                flat_gen = noisy_features.reshape(-1, noisy_features.shape[-1])
+                num_gen_tokens = gen_mask.sum().item()
+                if flat_gen.shape[0] >= num_gen_tokens:
+                    inputs_embeds[gen_mask] = flat_gen[:num_gen_tokens]
+
+        # Forward through language model (returns CausalLMOutputWithPast with .hidden_states)
+        outputs = self.language_model(
+            inputs_embeds=inputs_embeds,
+            image_gen_indicators=image_gen_indicators,
+            indexes=indexes,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+        hidden_states = outputs.hidden_states
+
+        # CE loss for understanding tokens
+        ce_loss = None
+        if labels is not None:
+            logits = self.language_model.lm_head(hidden_states)
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            ce_loss = torch.nn.functional.cross_entropy(
+                shift_logits.view(-1, self.language_model.vocab_size),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
+        # Flow-matching loss for generation tokens
+        if gen_pixel_values is not None and image_gen_indicators is not None and noise is not None:
+            gen_mask = image_gen_indicators.bool()
+            if gen_mask.any():
+                gen_hidden = hidden_states[gen_mask]
+                fm_pred = self.fm_modules["fm_head"](gen_hidden)
+                target = (noise - gen_features).reshape(-1, fm_pred.shape[-1])
+                num_gen = min(fm_pred.shape[0], target.shape[0])
+                fm_loss = torch.nn.functional.mse_loss(fm_pred[:num_gen], target[:num_gen])
+
+        # Combine losses
+        loss = None
+        if ce_loss is not None or fm_loss is not None:
+            loss = torch.tensor(0.0, device=device)
+            if ce_loss is not None:
+                loss = loss + ce_loss
+            if fm_loss is not None:
+                loss = loss + fm_loss
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=self.language_model.lm_head(hidden_states) if labels is None else None,
+            hidden_states=hidden_states,
+        )

@@ -1,0 +1,41 @@
+model:
+  model_path: /mnt/nas-tbt/tbt/checkpoint/hf_cache/BAGEL-7B-MoT
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+data:
+  train_path: configs/multimodal/data/tulu_sharegpt4v.yaml
+  data_type: conversation
+  chat_template: qwen2vl
+  max_seq_len: 4096
+  train_size: 80000000
+  mm_configs:
+    image_max_pixels: 602112
+
+train:
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+  gradient_checkpointing:
+    enable_reentrant: false
+  wandb:
+    enable: false
+    project: bagel_sft
+    name: bagel_sft
+  freeze_vit: true
+  freeze_vae: true
+  mse_weight: 1.0
+  ce_weight: 1.0
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
+  num_train_epochs: 1
+  micro_batch_size: 1
+  global_batch_size: 8
+  max_steps: 50
+  init_device: meta
+  checkpoint:
+    output_dir: bagel_sft_output
+    manager: dcp
+    save_hf_weights: false

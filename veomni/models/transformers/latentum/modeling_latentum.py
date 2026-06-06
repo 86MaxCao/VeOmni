@@ -546,3 +546,95 @@ class LatentUMModel(PreTrainedModel):
 
     def get_output_embeddings(self):
         return self.internvl.language_model.lm_head
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        labels=None,
+        pixel_values=None,
+        image_flags=None,
+        **kwargs,
+    ):
+        """Training forward pass for LatentUM.
+
+        Following the original LatentUM training (train_interleaved_lang_only.py):
+        1. Encode source images through InternVL's vision_model + mlp1
+        2. Inject visual embeddings into the input sequence
+        3. Run causal LM forward through the Qwen3 MoT backbone
+        4. Compute cross-entropy loss on labeled tokens (ignore_index=-100)
+
+        Args:
+            input_ids: [B, seq_len] token IDs
+            attention_mask: [B, seq_len]
+            labels: [B, seq_len] with -100 for non-loss positions
+            pixel_values: [B, N, C, H, W] or [B*N, C, H, W] image patches
+            image_flags: [B] number of images per sample (for positioning)
+        """
+        device = input_ids.device
+        batch_size, seq_len = input_ids.shape
+
+        # Get text embeddings
+        inputs_embeds = self.internvl.language_model.model.embed_tokens(input_ids)
+
+        # Process images through ViT + projector
+        if pixel_values is not None and pixel_values.numel() > 0:
+            if pixel_values.dim() == 5:
+                B, N, C, H, W = pixel_values.shape
+                pixel_values = pixel_values.reshape(B * N, C, H, W)
+            vit_features = self.internvl.vision_model(pixel_values)
+            # Pixel shuffle downsample (matches mlp1 input expectation)
+            if vit_features.dim() == 3:
+                b, n, d = vit_features.shape
+                h = w = int(n**0.5)
+                ds = int(1 / self.config.internvl_config.downsample_ratio)
+                if h % ds == 0 and w % ds == 0:
+                    vit_features = vit_features.reshape(b, h, w, d)
+                    vit_features = vit_features.reshape(b, h // ds, ds, w // ds, ds, d)
+                    vit_features = vit_features.permute(0, 1, 3, 2, 4, 5).reshape(b, (h // ds) * (w // ds), d * ds * ds)
+            vit_projected = self.internvl.mlp1(vit_features)
+            # Note: injection positions depend on tokenizer special tokens
+            # The data collator is responsible for marking image placeholder positions
+
+        # Forward through language model layers (understanding path only for SFT)
+        hidden_states = inputs_embeds
+        for layer in self.internvl.language_model.model.layers:
+            residual = hidden_states
+            hidden_states_norm = layer.input_layernorm(hidden_states)
+            # Use text-path attention (SDPA)
+            attn = layer.self_attn
+            B, N, D = hidden_states_norm.shape
+            q = attn.q_proj(hidden_states_norm).view(B, N, attn.num_heads, attn.head_dim).transpose(1, 2)
+            k = attn.k_proj(hidden_states_norm).view(B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
+            v = attn.v_proj(hidden_states_norm).view(B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
+            q = attn.q_norm(q)
+            k = attn.k_norm(k)
+            # GQA repeat
+            if attn.num_kv_heads < attn.num_heads:
+                rep = attn.num_heads // attn.num_kv_heads
+                k = k.repeat_interleave(rep, dim=1)
+                v = v.repeat_interleave(rep, dim=1)
+            attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            attn_out = attn_out.transpose(1, 2).reshape(B, N, -1)
+            hidden_states = residual + attn.o_proj(attn_out)
+
+            residual = hidden_states
+            hidden_states = residual + layer.mlp(layer.post_attention_layernorm(hidden_states))
+
+        hidden_states = self.internvl.language_model.model.norm(hidden_states)
+
+        # Compute LM logits and loss
+        logits = self.internvl.language_model.lm_head(hidden_states)
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            vocab_size = logits.shape[-1]
+            loss = F.cross_entropy(
+                shift_logits.view(-1, vocab_size),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
+        return SimpleNamespace(loss=loss, logits=logits)

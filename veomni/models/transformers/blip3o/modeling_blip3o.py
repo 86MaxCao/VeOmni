@@ -13,6 +13,7 @@ This model defines the full architecture that matches the BLIP3o checkpoint weig
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import PreTrainedModel
 
 from .configuration_blip3o import BLIP3oConfig
@@ -115,12 +116,21 @@ class Qwen2RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.eps = eps
 
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+        return self.weight * hidden_states.to(input_dtype)
+
 
 class Qwen2Attention(nn.Module):
     """Qwen2 attention with separate Q/K/V projections (biases on Q/K/V, no bias on O)."""
 
     def __init__(self, hidden_size: int, num_heads: int, num_kv_heads: int):
         super().__init__()
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.head_dim = hidden_size // num_heads
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=True)
         self.k_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=True)
@@ -134,6 +144,9 @@ class Qwen2MLP(nn.Module):
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+
+    def forward(self, x):
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Qwen2DecoderLayer(nn.Module):
@@ -579,3 +592,70 @@ class BLIP3oQwenForCausalLM(PreTrainedModel):
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        labels=None,
+        pixel_values=None,
+        **kwargs,
+    ):
+        """Training forward pass for BLIP3o.
+
+        Standard causal LM SFT: embed tokens, forward through decoder layers,
+        compute cross-entropy loss on labeled positions.
+
+        For understanding mode, visual features from the Qwen2.5-VL ViT are
+        injected at image placeholder positions in the input sequence (handled
+        by data collator). For pure language SFT, no pixel_values needed.
+
+        Args:
+            input_ids: [B, seq_len]
+            attention_mask: [B, seq_len]
+            labels: [B, seq_len] with -100 for non-loss tokens
+            pixel_values: optional [B, C, H, W] for understanding
+        """
+        device = input_ids.device
+        batch_size, seq_len = input_ids.shape
+
+        inputs_embeds = self.model.embed_tokens(input_ids)
+
+        # Forward through transformer layers with causal attention
+        hidden_states = inputs_embeds
+        for layer in self.model.layers:
+            residual = hidden_states
+            hidden_states_norm = layer.input_layernorm(hidden_states)
+            # Self-attention
+            attn = layer.self_attn
+            B, N, D = hidden_states_norm.shape
+            q = attn.q_proj(hidden_states_norm).view(B, N, attn.num_heads, attn.head_dim).transpose(1, 2)
+            k = attn.k_proj(hidden_states_norm).view(B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
+            v = attn.v_proj(hidden_states_norm).view(B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
+            # GQA repeat
+            if attn.num_kv_heads < attn.num_heads:
+                rep = attn.num_heads // attn.num_kv_heads
+                k = k.repeat_interleave(rep, dim=1)
+                v = v.repeat_interleave(rep, dim=1)
+            attn_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+            attn_out = attn_out.transpose(1, 2).reshape(B, N, -1)
+            hidden_states = residual + attn.o_proj(attn_out)
+            # MLP
+            residual = hidden_states
+            hidden_states = residual + layer.mlp(layer.post_attention_layernorm(hidden_states))
+
+        hidden_states = self.model.norm(hidden_states)
+        logits = self.lm_head(hidden_states)
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = torch.nn.functional.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
+        from types import SimpleNamespace
+        return SimpleNamespace(loss=loss, logits=logits)
