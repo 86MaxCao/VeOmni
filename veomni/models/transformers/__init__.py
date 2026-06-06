@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from . import (
+    blip3o,
     deepseek_v3,
     flux,
     glm_moe_dsa,
@@ -36,6 +37,7 @@ from . import (
 
 
 __all__ = [
+    "blip3o",
     "deepseek_v3",
     "flux",
     "janus",
