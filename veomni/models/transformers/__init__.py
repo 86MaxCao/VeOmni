@@ -14,6 +14,7 @@
 
 from . import (
     bagel,
+    blip3o,
     deepseek_v3,
     flux,
     glm_moe_dsa,
@@ -39,6 +40,7 @@ from . import (
 
 __all__ = [
     "bagel",
+    "blip3o",
     "deepseek_v3",
     "flux",
     "glm_moe_dsa",
