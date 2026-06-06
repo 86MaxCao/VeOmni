@@ -123,7 +123,12 @@ def _apply_2d_rotary_pos_emb(x, cos_x, sin_x, cos_y, sin_y, abs_x, abs_y):
 
 
 class NEOVisionEmbeddings(nn.Module):
-    """Patch embedding + 2D-RoPE + downsampling for NEO Vision."""
+    """Patch embedding + 2D-RoPE + downsampling for NEO Vision.
+
+    The RoPE cos/sin buffers are recomputed on first forward if they are found
+    to be all-zero (which happens when the model is materialised from
+    meta-device via ``init_empty_weights`` + ``to_empty``).
+    """
 
     def __init__(self, config: NEOVisionConfig):
         super().__init__()
@@ -159,9 +164,33 @@ class NEOVisionEmbeddings(nn.Module):
         self.register_buffer("cos_cached_y", cos_y, persistent=False)
         self.register_buffer("sin_cached_y", sin_y, persistent=False)
 
+    def _ensure_rope_buffers(self, device: torch.device) -> None:
+        """Reinitialise RoPE cos/sin buffers if they were zeroed by meta-device loading."""
+        if self.cos_cached_x is not None and self.cos_cached_x.abs().sum() > 0:
+            return
+        cos_x, sin_x = _precompute_rope_freqs_sincos(
+            self.rope_dim_part,
+            self.config.max_position_embeddings_vision,
+            base=self.config.rope_theta_vision,
+            device=device,
+        )
+        cos_y, sin_y = _precompute_rope_freqs_sincos(
+            self.rope_dim_part,
+            self.config.max_position_embeddings_vision,
+            base=self.config.rope_theta_vision,
+            device=device,
+        )
+        self.cos_cached_x = cos_x
+        self.sin_cached_x = sin_x
+        self.cos_cached_y = cos_y
+        self.sin_cached_y = sin_y
+
     def forward(self, pixel_values: torch.FloatTensor, grid_hw=None) -> torch.Tensor:
         pixel_values = pixel_values.view(-1, 3, self.patch_size, self.patch_size)
         patch_embeds = self.gelu(self.patch_embedding(pixel_values)).view(-1, self.embed_dim)
+
+        # Ensure RoPE buffers are initialised (may be zeroed after meta-device loading)
+        self._ensure_rope_buffers(patch_embeds.device)
 
         # Apply 2D RoPE
         abs_pos_x, abs_pos_y = _build_abs_positions_from_grid_hw(grid_hw, device=patch_embeds.device)
@@ -308,25 +337,36 @@ class Qwen3RotaryEmbedding(nn.Module):
 
     Uses a special frequency computation that effectively doubles the head_dim
     before selecting every other frequency, matching the original U1 implementation.
+
+    The ``inv_freq`` buffer is recomputed on first forward if it is found to be
+    all-zero (which happens when the model is materialised from meta-device via
+    ``init_empty_weights`` + ``to_empty``).
     """
 
     def __init__(self, config: NEOLLMConfig, rope_theta=None, max_position_embeddings=None, head_dim_override=None):
         super().__init__()
         self.config = config
-        effective_head_dim = head_dim_override if head_dim_override is not None else config.head_dim
-        effective_theta = rope_theta if rope_theta is not None else config.rope_theta
+        self._effective_head_dim = head_dim_override if head_dim_override is not None else config.head_dim
+        self._effective_theta = rope_theta if rope_theta is not None else config.rope_theta
         effective_max_pos = max_position_embeddings if max_position_embeddings is not None else config.max_position_embeddings
 
-        # Replicate the _rope_init_fn_keep_freq_range logic:
-        # Compute inv_freq for doubled head_dim, then take every other entry
-        doubled_dim = effective_head_dim * 2
-        full_inv_freq = 1.0 / (
-            effective_theta ** (torch.arange(0, doubled_dim, 2, dtype=torch.float32) / doubled_dim)
-        )
-        inv_freq = full_inv_freq[::2]  # Take every other => half the frequencies
-
+        inv_freq = self._compute_inv_freq()
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.max_seq_len_cached = effective_max_pos
+
+    def _compute_inv_freq(self) -> torch.Tensor:
+        """Compute inverse frequencies using the keep-freq-range pattern."""
+        doubled_dim = self._effective_head_dim * 2
+        full_inv_freq = 1.0 / (
+            self._effective_theta ** (torch.arange(0, doubled_dim, 2, dtype=torch.float32) / doubled_dim)
+        )
+        return full_inv_freq[::2]
+
+    def _ensure_inv_freq(self, device: torch.device) -> None:
+        """Reinitialise ``inv_freq`` if it was zeroed by meta-device loading."""
+        if self.inv_freq is not None and self.inv_freq.numel() > 0 and self.inv_freq.abs().sum() > 0:
+            return
+        self.inv_freq = self._compute_inv_freq().to(device=device)
 
     @torch.no_grad()
     def forward(self, x, position_ids):
@@ -337,6 +377,7 @@ class Qwen3RotaryEmbedding(nn.Module):
         Returns:
             cos, sin: [B, 1, S, D] tensors
         """
+        self._ensure_inv_freq(x.device)
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
 

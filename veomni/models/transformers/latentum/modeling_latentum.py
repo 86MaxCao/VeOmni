@@ -291,6 +291,12 @@ class Qwen3MoTForCausalLM(nn.Module):
         self.model = Qwen3MoTModel(hidden_size, intermediate_size, num_layers, num_heads, num_kv_heads, head_dim, vocab_size, rms_norm_eps)
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
 
 # ==============================================================================
 # Autoregressive Head

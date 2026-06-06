@@ -43,8 +43,19 @@ class VisionAttention(nn.Module):
 
     def __init__(self, hidden_size: int):
         super().__init__()
+        self.hidden_size = hidden_size
+        self.head_dim = 128
+        self.num_heads = hidden_size // self.head_dim
         self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=True)
         self.proj = nn.Linear(hidden_size, hidden_size, bias=True)
+
+    def forward(self, hidden_states):
+        B, N, C = hidden_states.shape
+        qkv = self.qkv(hidden_states).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = attn_out.transpose(1, 2).reshape(B, N, C)
+        return self.proj(attn_out)
 
 
 class VisionMLP(nn.Module):
@@ -55,6 +66,9 @@ class VisionMLP(nn.Module):
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=True)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=True)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=True)
+
+    def forward(self, x):
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class VisionBlock(nn.Module):
@@ -67,12 +81,18 @@ class VisionBlock(nn.Module):
         self.attn = VisionAttention(hidden_size)
         self.mlp = VisionMLP(hidden_size, intermediate_size)
 
+    def forward(self, hidden_states):
+        hidden_states = hidden_states + self.attn(self.norm1(hidden_states))
+        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+        return hidden_states
+
 
 class VisionMerger(nn.Module):
     """Merges vision tokens into LLM hidden space."""
 
     def __init__(self, hidden_size: int, out_hidden_size: int, spatial_merge_size: int):
         super().__init__()
+        self.spatial_merge_size = spatial_merge_size
         merge_dim = hidden_size * (spatial_merge_size ** 2)
         self.ln_q = nn.LayerNorm(hidden_size, elementwise_affine=True, bias=False)
         self.mlp = nn.Sequential(
@@ -80,6 +100,35 @@ class VisionMerger(nn.Module):
             nn.GELU(),
             nn.Linear(merge_dim, out_hidden_size, bias=True),
         )
+
+    def forward(self, hidden_states, grid_hw=None):
+        # hidden_states: [B, N, C] where N = h_patches * w_patches
+        hidden_states = self.ln_q(hidden_states)
+        B, N, C = hidden_states.shape
+        s = self.spatial_merge_size
+        # Determine spatial dimensions
+        if grid_hw is not None:
+            h, w = grid_hw
+        else:
+            h = w = int(N ** 0.5)
+            if h * w != N:
+                # Find h, w such that h*w == N and both divisible by s
+                for hh in range(int(N**0.5), 0, -1):
+                    if N % hh == 0:
+                        ww = N // hh
+                        if hh % s == 0 and ww % s == 0:
+                            h, w = hh, ww
+                            break
+        # Merge spatial_merge_size x spatial_merge_size patches
+        if h % s == 0 and w % s == 0 and h * w == N:
+            hidden_states = hidden_states.reshape(B, h, w, C)
+            hidden_states = hidden_states.reshape(B, h // s, s, w // s, s, C)
+            hidden_states = hidden_states.permute(0, 1, 3, 2, 4, 5).reshape(B, (h // s) * (w // s), C * s * s)
+        else:
+            # Fallback: linear grouping
+            n_merged = N // (s * s)
+            hidden_states = hidden_states[:, :n_merged * s * s, :].reshape(B, n_merged, C * s * s)
+        return self.mlp(hidden_states)
 
 
 class VisionEncoder(nn.Module):
@@ -91,6 +140,7 @@ class VisionEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         vc = config.vision_config
+        self.hidden_size = vc.hidden_size
         self.patch_embed = VisionPatchEmbed(
             in_channels=vc.in_channels,
             hidden_size=vc.hidden_size,
@@ -102,6 +152,32 @@ class VisionEncoder(nn.Module):
             for _ in range(vc.depth)
         ])
         self.merger = VisionMerger(vc.hidden_size, vc.out_hidden_size, vc.spatial_merge_size)
+
+    def forward(self, pixel_values):
+        """
+        Args:
+            pixel_values: [B, C, T, H, W] or [B, C, H, W] image tensor
+        Returns:
+            merged vision embeddings [B, num_merged_tokens, out_hidden_size]
+        """
+        if pixel_values.dim() == 4:
+            # [B, C, H, W] -> [B, C, 2, H, W] (duplicate for temporal_patch_size=2)
+            pixel_values = pixel_values.unsqueeze(2).expand(-1, -1, 2, -1, -1)
+        # Patch embed: Conv3D -> [B, hidden_size, t, h, w]
+        x = self.patch_embed.proj(pixel_values)
+        # Get spatial grid dims before flattening
+        _, _, t, h_out, w_out = x.shape
+        # Flatten spatial dims: [B, hidden_size, t*h*w] -> [B, t*h*w, hidden_size]
+        B = x.shape[0]
+        x = x.flatten(2).transpose(1, 2)
+        # Transformer blocks
+        for block in self.blocks:
+            x = block(x)
+        # Merger — pass grid dimensions for non-square handling
+        grid_h = t * h_out
+        grid_w = w_out
+        x = self.merger(x, grid_hw=(grid_h, grid_w))
+        return x
 
 
 # =============================================================================
