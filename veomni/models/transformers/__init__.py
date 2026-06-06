@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from . import (
+    bagel,
     deepseek_v3,
     flux,
     glm_moe_dsa,
@@ -36,8 +37,10 @@ from . import (
 
 
 __all__ = [
+    "bagel",
     "deepseek_v3",
     "flux",
+    "glm_moe_dsa",
     "janus",
     "llama",
     "movqgan",
@@ -50,9 +53,8 @@ __all__ = [
     "qwen3_5_moe",
     "qwen3_moe",
     "qwen3_omni_moe",
-    "seed_oss",
-    "wan",
     "qwen3_vl",
     "qwen3_vl_moe",
-    "glm_moe_dsa",
+    "seed_oss",
+    "wan",
 ]
