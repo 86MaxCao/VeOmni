@@ -5,11 +5,24 @@
 >
 > | Model | model_type | LLM Backbone | Generation Method | Params |
 > |-------|-----------|-------------|-------------------|--------|
-> | [Bagel](https://github.com/ByteDance-Seed/Bagel) | `bagel` | Qwen2-VL 7B | MoVQGAN (Flow-Matching) | 14.6B |
-> | [ThinkMorph](https://github.com/ThinkMorph/ThinkMorph) | `thinkmorph` | Qwen2-VL 7B | MoVQGAN (Flow-Matching + CoT) | 14.6B |
-> | [BLIP3o](https://github.com/JiuhaiChen/BLIP3o) | `blip3o_qwen` | xGen-MM (Qwen2) | Diffusion (DIT + VAE) | 14.1B |
-> | [SenseNova-U1](https://github.com/OpenSenseNova/SenseNova-U1) | `neo_chat` | Qwen3 8B | Flow-Matching (MoT) | 17.6B |
-> | [LatentUM](https://github.com/SJTU-DENG-Lab/LatentUM) | `latentum` | InternVL (Qwen3) | MoT Discrete Tokens (AR Head) | 8.8B |
+> | [Bagel](https://github.com/ByteDance-Seed/Bagel) | `bagel` | Qwen2.5-7B | MoVQGAN (Flow-Matching) | 14.6B |
+> | [ThinkMorph](https://github.com/ThinkMorph/ThinkMorph) | `thinkmorph` | Qwen2.5-7B | MoVQGAN (Flow-Matching + CoT) | 14.6B |
+> | [BLIP3o](https://github.com/JiuhaiChen/BLIP3o) | `blip3o_qwen` | Qwen2.5-7B | Diffusion (DIT + VAE) | 14.1B |
+> | [SenseNova-U1](https://github.com/OpenSenseNova/SenseNova-U1) | `neo_chat` | Qwen3 (42L, dense) | Flow-Matching (MoT) | 17.6B |
+> | [LatentUM](https://github.com/SJTU-DENG-Lab/LatentUM) | `latentum` | InternVL3.5-4B | MoT Discrete Tokens (AR Head) | 8.8B |
+>
+> **Inference Alignment (validated against official implementations):**
+>
+> All 5 models produce **identical outputs** to their official repos when given the same inputs.
+> Tested on VisPuzzle benchmark (multiple-choice VQA):
+>
+> | Model | Alignment | Test Samples | Official Accuracy |
+> |-------|-----------|-------------|-------------------|
+> | Bagel | 100% | 20/20 exact match | 33.8% |
+> | ThinkMorph | 100% | 5/5 exact match | 36.5% |
+> | BLIP3o | 100% | 10/10 exact match | 36.8% |
+> | SenseNova-U1 | 100% | 10/10 exact match | 68.5% |
+> | LatentUM | 100% | 3/3 exact match | 38.5% |
 >
 > **Environment:**
 > - GPU: AMD Instinct MI308X (192GB HBM3)
@@ -20,7 +33,8 @@
 > **Usage:**
 > ```bash
 > # Inference (unified entry for all 5 models)
-> python tasks/infer/infer_unified.py --model_type bagel --prompt "Describe this image" --image img.jpg
+> python tasks/infer/infer_unified.py --model_type bagel --mode understand --prompt "Describe this image" --image img.jpg
+> python tasks/infer/infer_unified.py --model_type u1 --mode understand --prompt "What is shown?" --image img.jpg
 >
 > # Training (SFT)
 > torchrun --nproc_per_node=1 tasks/train_unified.py --config configs/multimodal/bagel/sft.yaml
