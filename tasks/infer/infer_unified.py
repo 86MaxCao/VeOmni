@@ -166,21 +166,34 @@ def infer_bagel_understand(model, config, tokenizer, image: Optional[Image.Image
             self.min_size = min_size
             self.patch_size = patch_size
 
+        def _make_divisible(self, value, stride):
+            return max(stride, int(round(value / stride) * stride))
+
         def __call__(self, img):
             w, h = img.size
-            if max(w, h) > self.max_size:
-                scale = self.max_size / max(w, h)
-                w, h = int(w * scale), int(h * scale)
-            if min(w, h) < self.min_size:
-                scale = self.min_size / min(w, h)
-                w, h = int(w * scale), int(h * scale)
-            w = max((w // self.patch_size) * self.patch_size, self.patch_size)
-            h = max((h // self.patch_size) * self.patch_size, self.patch_size)
-            img = img.resize((w, h), Image.LANCZOS)
-            return torch.tensor(np.array(img)).permute(2, 0, 1).float() / 255.0
+            scale = min(self.max_size / max(w, h), 1.0)
+            scale = max(scale, self.min_size / min(w, h))
+            new_w = self._make_divisible(round(w * scale), self.patch_size)
+            new_h = self._make_divisible(round(h * scale), self.patch_size)
+            img = img.resize((new_w, new_h), Image.BICUBIC)
+            tensor = torch.tensor(np.array(img)).permute(2, 0, 1).float() / 255.0
+            tensor = (tensor - 0.5) / 0.5
+            return tensor
+
+    def _vae_resize(img, max_size=1024, min_size=512, stride=16):
+        w, h = img.size
+        scale = min(max_size / max(w, h), 1.0)
+        scale = max(scale, min_size / min(w, h))
+        new_w = max(stride, int(round(round(w * scale) / stride) * stride))
+        new_h = max(stride, int(round(round(h * scale) / stride) * stride))
+        return img.resize((new_w, new_h), Image.BICUBIC)
 
     image_transform = _ImageTransform(980, 224, config.vit_config.patch_size)
-    images = [pil_img2rgb(image)] if image is not None else []
+    images = []
+    if image is not None:
+        img = pil_img2rgb(image)
+        img = _vae_resize(img)
+        images = [img]
 
     return model.chat(
         tokenizer=tokenizer,
