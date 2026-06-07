@@ -947,12 +947,25 @@ class NEOChatModel(PreTrainedModel):
                 if flat_gen.shape[0] >= num_gen_tokens:
                     inputs_embeds[gen_mask] = flat_gen[:num_gen_tokens]
 
+        # Build 4D causal attention mask from 2D padding mask
+        # attention code expects [B, 1, S, S] additive mask (0 = attend, -inf = mask)
+        causal_mask = torch.triu(
+            torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=inputs_embeds.dtype),
+            diagonal=1,
+        )
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
+        if attention_mask is not None and attention_mask.dim() == 2:
+            # Combine with padding mask: masked positions (0) get -inf
+            pad_mask = attention_mask[:, None, None, :].to(inputs_embeds.dtype)
+            pad_mask = torch.where(pad_mask == 0, torch.tensor(float("-inf"), device=device, dtype=inputs_embeds.dtype), torch.zeros_like(pad_mask))
+            causal_mask = causal_mask + pad_mask
+
         # Forward through language model (returns CausalLMOutputWithPast with .hidden_states)
         outputs = self.language_model(
             inputs_embeds=inputs_embeds,
             image_gen_indicators=image_gen_indicators,
             indexes=indexes,
-            attention_mask=attention_mask,
+            attention_mask=causal_mask,
             use_cache=False,
         )
         hidden_states = outputs.hidden_states

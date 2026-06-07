@@ -201,17 +201,19 @@ class Qwen2RMSNorm(nn.Module):
 
 
 class Qwen2Attention(nn.Module):
-    """Qwen2 attention with separate Q/K/V projections (biases on Q/K/V, no bias on O)."""
+    """Matches Qwen3ForCausalLM used by official BLIP3o: no Q/K/V bias, with QK norm."""
 
     def __init__(self, hidden_size: int, num_heads: int, num_kv_heads: int):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = hidden_size // num_heads
-        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=True)
-        self.k_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=True)
+        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.q_norm = Qwen2RMSNorm(self.head_dim)
+        self.k_norm = Qwen2RMSNorm(self.head_dim)
 
 
 class Qwen2MLP(nn.Module):
@@ -697,23 +699,43 @@ class BLIP3oQwenForCausalLM(PreTrainedModel):
 
         inputs_embeds = self.model.embed_tokens(input_ids)
 
+        # Precompute RoPE embeddings
+        head_dim = self.config.hidden_size // self.config.num_attention_heads
+        inv_freq = 1.0 / (self.config.rope_theta ** (
+            torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim
+        ))
+        positions = torch.arange(seq_len, device=device, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        rope_cos = emb.cos()[None, None, :, :]  # [1, 1, S, D]
+        rope_sin = emb.sin()[None, None, :, :]
+
         # Forward through transformer layers with causal attention
         hidden_states = inputs_embeds
         for layer in self.model.layers:
             residual = hidden_states
             hidden_states_norm = layer.input_layernorm(hidden_states)
-            # Self-attention
+            # Self-attention with RoPE
             attn = layer.self_attn
             B, N, D = hidden_states_norm.shape
             q = attn.q_proj(hidden_states_norm).view(B, N, attn.num_heads, attn.head_dim).transpose(1, 2)
             k = attn.k_proj(hidden_states_norm).view(B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
             v = attn.v_proj(hidden_states_norm).view(B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
+            q = attn.q_norm(q)
+            k = attn.k_norm(k)
+            # Apply rotary position embeddings
+            q1, q2 = q[..., : head_dim // 2], q[..., head_dim // 2 :]
+            q_rotated = torch.cat((-q2, q1), dim=-1)
+            q = q * rope_cos + q_rotated * rope_sin
+            k1, k2 = k[..., : head_dim // 2], k[..., head_dim // 2 :]
+            k_rotated = torch.cat((-k2, k1), dim=-1)
+            k = k * rope_cos + k_rotated * rope_sin
             # GQA repeat
             if attn.num_kv_heads < attn.num_heads:
                 rep = attn.num_heads // attn.num_kv_heads
                 k = k.repeat_interleave(rep, dim=1)
                 v = v.repeat_interleave(rep, dim=1)
-            attn_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+            attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             attn_out = attn_out.transpose(1, 2).reshape(B, N, -1)
             hidden_states = residual + attn.o_proj(attn_out)
             # MLP

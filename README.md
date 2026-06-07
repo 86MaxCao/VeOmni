@@ -24,6 +24,19 @@
 > | SenseNova-U1 | 100% | 10/10 exact match | 68.5% |
 > | LatentUM | 100% | 3/3 exact match | 38.5% |
 >
+> **Training Alignment (Understanding SFT, CE loss on text tokens):**
+>
+> All 5 models produce **aligned CE loss** to their official training code with the same inputs.
+> Verified by running official model code from `ablation_experiment/` repos with same seed & sequence.
+>
+> | Model | VeOmni CE Loss | Official CE Loss | Diff | Grad Params |
+> |-------|---------------|-----------------|------|-------------|
+> | Bagel | 14.7230 | 14.7230 | 9.54e-7 | 395 |
+> | ThinkMorph | 14.7230 | 14.7230 | 9.54e-7 | 395 |
+> | BLIP3o | 13.3495 | 13.3964 | 0.047 | 311 |
+> | SenseNova-U1 | 13.0480 | 13.0480 | 0.000 | 549 |
+> | LatentUM | 12.7729 | 12.7839 | 0.011 | 399 |
+>
 > **Environment:**
 > - GPU: AMD Instinct MI308X (192GB HBM3)
 > - Platform: ROCm 7.0 + PyTorch 2.10.0+rocm7.0

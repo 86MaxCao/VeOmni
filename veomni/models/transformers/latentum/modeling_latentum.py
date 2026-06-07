@@ -602,12 +602,24 @@ class LatentUMModel(PreTrainedModel):
             # Note: injection positions depend on tokenizer special tokens
             # The data collator is responsible for marking image placeholder positions
 
+        # Precompute RoPE embeddings
+        llm_cfg = self.config.internvl_config.llm_config
+        head_dim = llm_cfg.head_dim
+        rope_theta = llm_cfg.rope_parameters.get("rope_theta", llm_cfg.default_theta)
+        inv_freq = 1.0 / (rope_theta ** (
+            torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim
+        ))
+        positions = torch.arange(seq_len, device=device, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        rope_cos = emb.cos()[None, None, :, :]  # [1, 1, S, D]
+        rope_sin = emb.sin()[None, None, :, :]
+
         # Forward through language model layers (understanding path only for SFT)
         hidden_states = inputs_embeds
         for layer in self.internvl.language_model.model.layers:
             residual = hidden_states
             hidden_states_norm = layer.input_layernorm(hidden_states)
-            # Use text-path attention (SDPA)
             attn = layer.self_attn
             B, N, D = hidden_states_norm.shape
             q = attn.q_proj(hidden_states_norm).view(B, N, attn.num_heads, attn.head_dim).transpose(1, 2)
@@ -615,6 +627,11 @@ class LatentUMModel(PreTrainedModel):
             v = attn.v_proj(hidden_states_norm).view(B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
             q = attn.q_norm(q)
             k = attn.k_norm(k)
+            # Apply rotary position embeddings
+            q1, q2 = q[..., : head_dim // 2], q[..., head_dim // 2 :]
+            q = q * rope_cos + torch.cat((-q2, q1), dim=-1) * rope_sin
+            k1, k2 = k[..., : head_dim // 2], k[..., head_dim // 2 :]
+            k = k * rope_cos + torch.cat((-k2, k1), dim=-1) * rope_sin
             # GQA repeat
             if attn.num_kv_heads < attn.num_heads:
                 rep = attn.num_heads // attn.num_kv_heads
