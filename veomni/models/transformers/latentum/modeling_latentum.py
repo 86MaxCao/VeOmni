@@ -303,6 +303,22 @@ class Qwen3MoTForCausalLM(nn.Module):
 # ==============================================================================
 
 
+def _precompute_freqs_cis_1d(dim: int, seq_len: int, theta: float = 10000.0) -> torch.Tensor:
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    pos = torch.arange(seq_len)
+    freqs = torch.outer(pos, freqs).float()
+    return torch.polar(torch.ones_like(freqs), freqs)
+
+
+def _apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor):
+    freqs_cis = freqs_cis[None, :, None, :]
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
 class ARHeadRMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-5):
         super().__init__()
@@ -331,6 +347,20 @@ class ARHeadAttention(nn.Module):
         self.k_norm = ARHeadRMSNorm(self.head_dim)
         self.proj = nn.Linear(hidden_size, hidden_size)
 
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 1, 3, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # [B, N, H, Hc]
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        q, k = _apply_rotary_emb(q, k, freqs_cis=freqs_cis)
+        q = q.transpose(1, 2)  # [B, H, N, Hc]
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        out = out.transpose(1, 2).reshape(B, N, C)
+        return self.proj(out)
+
 
 class ARHeadFeedForward(nn.Module):
     def __init__(self, hidden_size: int, mlp_ratio: float = 4.0):
@@ -352,6 +382,11 @@ class ARHeadDecoderLayer(nn.Module):
         self.norm2 = ARHeadRMSNorm(hidden_size, eps=1e-6)
         self.mlp = ARHeadFeedForward(hidden_size, mlp_ratio)
 
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x), freqs_cis)
+        x = x + self.mlp(self.norm2(x))
+        return x
+
 
 class AutoregressiveHead(nn.Module):
     """
@@ -363,6 +398,9 @@ class AutoregressiveHead(nn.Module):
 
     def __init__(self, num_codebooks: int, num_layers: int, hidden_size: int, num_embeddings: int, num_heads: int, mlp_ratio: float = 4.0):
         super().__init__()
+        self.num_codebooks = num_codebooks
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
         self.embeddings = nn.ModuleList(
             [nn.Embedding(num_embeddings, hidden_size) for _ in range(num_codebooks)]
         )
@@ -371,6 +409,42 @@ class AutoregressiveHead(nn.Module):
         )
         self.norm = ARHeadRMSNorm(hidden_size, eps=1e-5)
         self.head = nn.Linear(hidden_size, num_embeddings)
+        self._freqs_cache: dict[int, torch.Tensor] = {}
+
+    def _code_to_embeddings(self, code: torch.Tensor) -> torch.Tensor:
+        """Convert codebook indices to embeddings.
+
+        Args:
+            code: (B, L, K) codebook indices where K = num_codebooks
+        Returns:
+            (B*L, K, D) embeddings
+        """
+        B, L, K = code.shape
+        code = code.reshape(B * L, K)
+        embs = []
+        for i in range(K):
+            embs.append(self.embeddings[i](code[:, i]))
+        return torch.stack(embs, dim=1)
+
+    def _get_freqs_cis(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        if seq_len not in self._freqs_cache:
+            head_dim = self.hidden_size // self.num_heads
+            self._freqs_cache[seq_len] = _precompute_freqs_cis_1d(head_dim, seq_len)
+        return self._freqs_cache[seq_len].to(device)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the AR head decoder layers.
+
+        Args:
+            x: (B, N, D) input sequence
+        Returns:
+            (B, N, num_embeddings) logits
+        """
+        freqs_cis = self._get_freqs_cis(x.shape[1], x.device)
+        for layer in self.layers:
+            x = layer(x, freqs_cis)
+        x = self.norm(x)
+        return self.head(x)
 
 
 # ==============================================================================
@@ -388,6 +462,21 @@ class VectorQuantizer(nn.Module):
         self.codebook = nn.Embedding(num_embeddings, embedding_dim)
         self.register_buffer("ema_usage", torch.zeros(num_embeddings))
 
+    def quantize(self, z: torch.Tensor):
+        """Find nearest codebook entries.
+
+        Args:
+            z: (..., D) continuous features
+        Returns:
+            z_q: (..., D) quantized features
+            indices: (...) codebook indices
+        """
+        flat = z.reshape(-1, self.embedding_dim)
+        dist = torch.cdist(flat.float(), self.codebook.weight.float())
+        indices = dist.argmin(dim=-1)
+        z_q = self.codebook(indices)
+        return z_q.reshape(z.shape), indices.reshape(z.shape[:-1])
+
 
 class MultiVectorQuantizer(nn.Module):
     """Multi-codebook (product) vector quantizer."""
@@ -400,6 +489,27 @@ class MultiVectorQuantizer(nn.Module):
         self.quantizers = nn.ModuleList(
             [VectorQuantizer(num_embeddings, dim_per_codebook) for _ in range(num_codebooks)]
         )
+
+    def quantize(self, z: torch.Tensor):
+        """Product quantization across codebooks.
+
+        Args:
+            z: (..., D) features where D = num_codebooks * dim_per_codebook
+        Returns:
+            z_q: (..., D) quantized features
+            indices: (..., num_codebooks) codebook indices
+        """
+        dim_per_cb = self.embedding_dim // self.num_codebooks
+        z_splits = z.split(dim_per_cb, dim=-1)
+        z_qs = []
+        all_indices = []
+        for i, (vq, z_i) in enumerate(zip(self.quantizers, z_splits)):
+            z_q_i, idx_i = vq.quantize(z_i)
+            z_qs.append(z_q_i)
+            all_indices.append(idx_i)
+        z_q = torch.cat(z_qs, dim=-1)
+        indices = torch.stack(all_indices, dim=-1)
+        return z_q, indices
 
 
 class VQ_MLP_MCQ(nn.Module):
@@ -425,6 +535,19 @@ class VQ_MLP_MCQ(nn.Module):
             nn.GELU(),
             nn.Linear(4 * llm_hidden_size, llm_hidden_size),
         )
+
+    def get_zq_indices(self, vit_features: torch.Tensor):
+        """Encode ViT features to quantized latents and codebook indices.
+
+        Args:
+            vit_features: (B, L, D) ViT features (post pixel-shuffle, pre-mlp1)
+        Returns:
+            z_q: (B, L, embedding_dim) quantized latent vectors
+            indices: (B, L, num_codebooks) codebook indices
+        """
+        z = self.down_proj(vit_features)
+        z_q, indices = self.quantizer.quantize(z)
+        return z_q, indices
 
 
 # ==============================================================================
@@ -481,6 +604,25 @@ class InternVLChatModel(nn.Module):
 
         # AR head (set externally)
         self.ar_head: nn.Module = None  # type: ignore[assignment]
+
+    def get_vit_feature(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Get ViT features with pixel shuffle but WITHOUT mlp1.
+
+        Used for VQ encoding of target images (generation path).
+        """
+        vit_features = self.vision_model(pixel_values)
+        if vit_features.dim() == 3:
+            b, n, d = vit_features.shape
+            h = w = int(n ** 0.5)
+            if h * w < n:
+                vit_features = vit_features[:, :h * w, :]
+                n = h * w
+            ds = int(1 / self.config.downsample_ratio)
+            if h % ds == 0 and w % ds == 0:
+                vit_features = vit_features.reshape(b, h, w, d)
+                vit_features = vit_features.reshape(b, h // ds, ds, w // ds, ds, d)
+                vit_features = vit_features.permute(0, 1, 3, 2, 4, 5).reshape(b, (h // ds) * (w // ds), d * ds * ds)
+        return vit_features
 
 
 # ==============================================================================
@@ -553,6 +695,99 @@ class LatentUMModel(PreTrainedModel):
     def get_output_embeddings(self):
         return self.internvl.language_model.lm_head
 
+    def _llm_forward(self, inputs_embeds, vision_token_mask=None, attention_mask_4d=None):
+        """Forward through LLM layers with MoT routing.
+
+        Args:
+            inputs_embeds: [B, S, D] input embeddings
+            vision_token_mask: [B, S] float mask (1.0=vision/gen, 0.0=text)
+            attention_mask_4d: [B, 1, S, S] additive attention mask (optional)
+        Returns:
+            hidden_states: [B, S, D]
+        """
+        device = inputs_embeds.device
+        B, S, D = inputs_embeds.shape
+        llm_cfg = self.config.internvl_config.llm_config
+        head_dim = llm_cfg.head_dim
+        rope_theta = llm_cfg.rope_parameters.get("rope_theta", llm_cfg.default_theta)
+        inv_freq = 1.0 / (rope_theta ** (
+            torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim
+        ))
+        positions = torch.arange(S, device=device, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        rope_cos = emb.cos()[None, None, :, :]
+        rope_sin = emb.sin()[None, None, :, :]
+
+        has_mot = vision_token_mask is not None and vision_token_mask.any()
+        if has_mot:
+            vmask = vision_token_mask[:, None, :, None]  # [B, 1, S, 1]
+
+        hidden_states = inputs_embeds
+        for layer in self.internvl.language_model.model.layers:
+            residual = hidden_states
+            hidden_states_norm = layer.input_layernorm(hidden_states)
+            attn = layer.self_attn
+            _B, N, _D = hidden_states_norm.shape
+
+            if has_mot:
+                q_t = attn.q_proj(hidden_states_norm).view(_B, N, attn.num_heads, attn.head_dim).transpose(1, 2)
+                k_t = attn.k_proj(hidden_states_norm).view(_B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
+                v_t = attn.v_proj(hidden_states_norm).view(_B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
+                q_v = attn.q_proj_vision(hidden_states_norm).view(_B, N, attn.num_heads, attn.head_dim).transpose(1, 2)
+                k_v = attn.k_proj_vision(hidden_states_norm).view(_B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
+                v_v = attn.v_proj_vision(hidden_states_norm).view(_B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
+                q_t = attn.q_norm(q_t)
+                k_t = attn.k_norm(k_t)
+                q_v = attn.q_norm_vision(q_v)
+                k_v = attn.k_norm_vision(k_v)
+                q = vmask * q_v + (1 - vmask) * q_t
+                k = vmask * k_v + (1 - vmask) * k_t
+                v = vmask * v_v + (1 - vmask) * v_t
+            else:
+                q = attn.q_proj(hidden_states_norm).view(_B, N, attn.num_heads, attn.head_dim).transpose(1, 2)
+                k = attn.k_proj(hidden_states_norm).view(_B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
+                v = attn.v_proj(hidden_states_norm).view(_B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
+                q = attn.q_norm(q)
+                k = attn.k_norm(k)
+
+            q1, q2 = q[..., : head_dim // 2], q[..., head_dim // 2:]
+            q = q * rope_cos + torch.cat((-q2, q1), dim=-1) * rope_sin
+            k1, k2 = k[..., : head_dim // 2], k[..., head_dim // 2:]
+            k = k * rope_cos + torch.cat((-k2, k1), dim=-1) * rope_sin
+
+            if attn.num_kv_heads < attn.num_heads:
+                rep = attn.num_heads // attn.num_kv_heads
+                k = k.repeat_interleave(rep, dim=1)
+                v = v.repeat_interleave(rep, dim=1)
+
+            if attention_mask_4d is not None:
+                attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask_4d)
+            else:
+                attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            attn_out = attn_out.transpose(1, 2).reshape(_B, N, -1)
+
+            if has_mot:
+                o_t = attn.o_proj(attn_out)
+                o_v = attn.o_proj_vision(attn_out)
+                vmask_s = vision_token_mask[:, :, None]  # [B, S, 1]
+                hidden_states = residual + vmask_s * o_v + (1 - vmask_s) * o_t
+            else:
+                hidden_states = residual + attn.o_proj(attn_out)
+
+            residual = hidden_states
+            post_norm = layer.post_attention_layernorm(hidden_states)
+            if has_mot:
+                mlp_t = layer.mlp(post_norm)
+                mlp_v = layer.mlp_vision(post_norm)
+                vmask_s = vision_token_mask[:, :, None]
+                hidden_states = residual + vmask_s * mlp_v + (1 - vmask_s) * mlp_t
+            else:
+                hidden_states = residual + layer.mlp(post_norm)
+
+        hidden_states = self.internvl.language_model.model.norm(hidden_states)
+        return hidden_states
+
     def forward(
         self,
         input_ids=None,
@@ -560,104 +795,119 @@ class LatentUMModel(PreTrainedModel):
         labels=None,
         pixel_values=None,
         image_flags=None,
+        target_pixel_values=None,
+        vision_token_mask=None,
+        gen_token_starts=None,
+        num_image_tokens=None,
+        attention_mask_4d=None,
         **kwargs,
     ):
         """Training forward pass for LatentUM.
 
-        Following the original LatentUM training (train_interleaved_lang_only.py):
-        1. Encode source images through InternVL's vision_model + mlp1
-        2. Inject visual embeddings into the input sequence
-        3. Run causal LM forward through the Qwen3 MoT backbone
-        4. Compute cross-entropy loss on labeled tokens (ignore_index=-100)
+        Supports understanding SFT and generation training:
+        - Understanding: standard causal LM with ViT features injected
+        - Generation: VQ encode targets → dual-sequence with MoT → AR head → CE loss
 
         Args:
             input_ids: [B, seq_len] token IDs
             attention_mask: [B, seq_len]
             labels: [B, seq_len] with -100 for non-loss positions
-            pixel_values: [B, N, C, H, W] or [B*N, C, H, W] image patches
-            image_flags: [B] number of images per sample (for positioning)
+            pixel_values: [B*N, C, H, W] source images for understanding
+            image_flags: [B] number of images per sample
+            target_pixel_values: [B*K, C, H, W] target images for generation
+            vision_token_mask: [B, seq_len] float (1=vision/gen, 0=text) for MoT
+            gen_token_starts: list of (batch_idx, start_pos, num_tokens) for gen blocks
+            num_image_tokens: int, number of visual tokens per image (default 256)
+            attention_mask_4d: [B, 1, S, S] custom 4D attention mask
         """
         device = input_ids.device
         batch_size, seq_len = input_ids.shape
 
-        # Get text embeddings
         inputs_embeds = self.internvl.language_model.model.embed_tokens(input_ids)
 
-        # Process images through ViT + projector
+        # Process source images through ViT + mlp1 (understanding path)
         if pixel_values is not None and pixel_values.numel() > 0:
             if pixel_values.dim() == 5:
-                B, N, C, H, W = pixel_values.shape
-                pixel_values = pixel_values.reshape(B * N, C, H, W)
-            vit_features = self.internvl.vision_model(pixel_values)
-            # Pixel shuffle downsample (matches mlp1 input expectation)
-            if vit_features.dim() == 3:
-                b, n, d = vit_features.shape
-                h = w = int(n**0.5)
-                ds = int(1 / self.config.internvl_config.downsample_ratio)
-                if h % ds == 0 and w % ds == 0:
-                    vit_features = vit_features.reshape(b, h, w, d)
-                    vit_features = vit_features.reshape(b, h // ds, ds, w // ds, ds, d)
-                    vit_features = vit_features.permute(0, 1, 3, 2, 4, 5).reshape(b, (h // ds) * (w // ds), d * ds * ds)
+                pixel_values = pixel_values.reshape(-1, *pixel_values.shape[2:])
+            with torch.no_grad():
+                vit_features = self.internvl.vision_model(pixel_values)
+                if vit_features.dim() == 3:
+                    b, n, d = vit_features.shape
+                    h = w = int(n ** 0.5)
+                    ds = int(1 / self.config.internvl_config.downsample_ratio)
+                    if h % ds == 0 and w % ds == 0:
+                        vit_features = vit_features.reshape(b, h, w, d)
+                        vit_features = vit_features.reshape(b, h // ds, ds, w // ds, ds, d)
+                        vit_features = vit_features.permute(0, 1, 3, 2, 4, 5).reshape(b, (h // ds) * (w // ds), d * ds * ds)
             vit_projected = self.internvl.mlp1(vit_features)
-            # Note: injection positions depend on tokenizer special tokens
-            # The data collator is responsible for marking image placeholder positions
 
-        # Precompute RoPE embeddings
-        llm_cfg = self.config.internvl_config.llm_config
-        head_dim = llm_cfg.head_dim
-        rope_theta = llm_cfg.rope_parameters.get("rope_theta", llm_cfg.default_theta)
-        inv_freq = 1.0 / (rope_theta ** (
-            torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim
-        ))
-        positions = torch.arange(seq_len, device=device, dtype=torch.float32)
-        freqs = torch.outer(positions, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        rope_cos = emb.cos()[None, None, :, :]  # [1, 1, S, D]
-        rope_sin = emb.sin()[None, None, :, :]
+        # VQ encode target images for generation
+        code_tgt = None
+        z_q = None
+        if target_pixel_values is not None and target_pixel_values.numel() > 0:
+            with torch.no_grad():
+                vit_feat_tgt = self.internvl.get_vit_feature(target_pixel_values)
+                z_q, code_tgt = self.quantizer.get_zq_indices(vit_feat_tgt)
 
-        # Forward through language model layers (understanding path only for SFT)
-        hidden_states = inputs_embeds
-        for layer in self.internvl.language_model.model.layers:
-            residual = hidden_states
-            hidden_states_norm = layer.input_layernorm(hidden_states)
-            attn = layer.self_attn
-            B, N, D = hidden_states_norm.shape
-            q = attn.q_proj(hidden_states_norm).view(B, N, attn.num_heads, attn.head_dim).transpose(1, 2)
-            k = attn.k_proj(hidden_states_norm).view(B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
-            v = attn.v_proj(hidden_states_norm).view(B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
-            q = attn.q_norm(q)
-            k = attn.k_norm(k)
-            # Apply rotary position embeddings
-            q1, q2 = q[..., : head_dim // 2], q[..., head_dim // 2 :]
-            q = q * rope_cos + torch.cat((-q2, q1), dim=-1) * rope_sin
-            k1, k2 = k[..., : head_dim // 2], k[..., head_dim // 2 :]
-            k = k * rope_cos + torch.cat((-k2, k1), dim=-1) * rope_sin
-            # GQA repeat
-            if attn.num_kv_heads < attn.num_heads:
-                rep = attn.num_heads // attn.num_kv_heads
-                k = k.repeat_interleave(rep, dim=1)
-                v = v.repeat_interleave(rep, dim=1)
-            attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            attn_out = attn_out.transpose(1, 2).reshape(B, N, -1)
-            hidden_states = residual + attn.o_proj(attn_out)
+        # Forward through LLM with MoT routing
+        hidden_states = self._llm_forward(
+            inputs_embeds,
+            vision_token_mask=vision_token_mask,
+            attention_mask_4d=attention_mask_4d,
+        )
 
-            residual = hidden_states
-            hidden_states = residual + layer.mlp(layer.post_attention_layernorm(hidden_states))
-
-        hidden_states = self.internvl.language_model.model.norm(hidden_states)
-
-        # Compute LM logits and loss
+        # CE loss for understanding tokens
         logits = self.internvl.language_model.lm_head(hidden_states)
-
-        loss = None
+        ce_loss = None
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             vocab_size = logits.shape[-1]
-            loss = F.cross_entropy(
+            ce_loss = F.cross_entropy(
                 shift_logits.view(-1, vocab_size),
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
 
-        return SimpleNamespace(loss=loss, logits=logits)
+        # AR generation loss
+        ar_loss = None
+        if code_tgt is not None and gen_token_starts is not None:
+            _num_img_tokens = num_image_tokens or 256
+            num_codebooks = self.internvl.ar_head.num_codebooks
+            num_embeddings = self.internvl.ar_head.head.out_features
+
+            total_ar_loss = torch.tensor(0.0, device=device, dtype=hidden_states.dtype)
+            valid_count = 0
+            for batch_idx, start_pos, n_tokens in gen_token_starts:
+                gen_hidden = hidden_states[batch_idx, start_pos:start_pos + _num_img_tokens, :]
+                img_idx = valid_count
+                code_n = code_tgt[img_idx]  # [L, K]
+
+                BL = gen_hidden.shape[0]
+                prefix = gen_hidden.unsqueeze(1)  # [L, 1, D]
+                code_emb = self.internvl.ar_head._code_to_embeddings(
+                    code_n.unsqueeze(0)
+                )  # [L, K, D]
+                h = torch.cat((prefix, code_emb), dim=1)  # [L, 1+K, D]
+                ar_logits = self.internvl.ar_head(h[:, :-1, :])  # [L, K, V]
+
+                loss_n = F.cross_entropy(
+                    ar_logits.reshape(-1, num_embeddings),
+                    code_n.reshape(-1),
+                )
+                total_ar_loss = total_ar_loss + loss_n
+                valid_count += 1
+
+            if valid_count > 0:
+                ar_loss = total_ar_loss / valid_count
+
+        # Combine losses
+        loss = None
+        if ce_loss is not None or ar_loss is not None:
+            loss = torch.tensor(0.0, device=device, dtype=hidden_states.dtype)
+            if ce_loss is not None:
+                loss = loss + ce_loss
+            if ar_loss is not None:
+                loss = loss + ar_loss
+
+        return SimpleNamespace(loss=loss, logits=logits, ar_loss=ar_loss)

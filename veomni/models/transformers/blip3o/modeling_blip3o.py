@@ -245,26 +245,50 @@ class Qwen2DecoderLayer(nn.Module):
 class DiTSelfAttention(nn.Module):
     """Self-attention (attn1) in DIT blocks - no output projection."""
 
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, num_heads: int):
         super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
         self.to_q = nn.Linear(dim, dim, bias=False)
         self.to_k = nn.Linear(dim, dim, bias=False)
         self.to_v = nn.Linear(dim, dim, bias=False)
         self.norm_q = nn.LayerNorm(dim, elementwise_affine=True)
         self.norm_k = nn.LayerNorm(dim, elementwise_affine=True)
 
+    def forward(self, x):
+        B, N, C = x.shape
+        q = self.norm_q(self.to_q(x)).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.norm_k(self.to_k(x)).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.to_v(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        out = F.scaled_dot_product_attention(q, k, v)
+        return out.transpose(1, 2).reshape(B, N, C)
+
 
 class DiTCrossAttention(nn.Module):
-    """Cross-attention (attn2) in DIT blocks - has output projection."""
+    """Cross-attention (attn2) in DIT blocks - has output projection and gating."""
 
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, num_heads: int):
         super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
         self.to_q = nn.Linear(dim, dim, bias=False)
         self.to_k = nn.Linear(dim, dim, bias=False)
         self.to_v = nn.Linear(dim, dim, bias=False)
         self.to_out = nn.ModuleList([nn.Linear(dim, dim, bias=False)])
         self.norm_q = nn.LayerNorm(dim, elementwise_affine=True)
         self.norm_k = nn.LayerNorm(dim, elementwise_affine=True)
+
+    def forward(self, x, context, gate=None):
+        B, N, C = x.shape
+        _, S, _ = context.shape
+        q = self.norm_q(self.to_q(x)).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.norm_k(self.to_k(context)).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.to_v(context).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        out = F.scaled_dot_product_attention(q, k, v)
+        if gate is not None:
+            out = out * gate.view(1, -1, 1, 1).sigmoid()
+        out = out.transpose(1, 2).reshape(B, N, C)
+        return self.to_out[0](out)
 
 
 class DiTFeedForward(nn.Module):
@@ -276,20 +300,23 @@ class DiTFeedForward(nn.Module):
         self.linear_2 = nn.Linear(ffn_dim, dim, bias=False)
         self.linear_3 = nn.Linear(dim, ffn_dim, bias=False)
 
+    def forward(self, x):
+        return self.linear_2(F.silu(self.linear_1(x)) * self.linear_3(x))
+
 
 class DiTAdaLayerNorm(nn.Module):
     """Adaptive layer norm with time conditioning."""
 
     def __init__(self, dim: int, time_embed_dim: int):
         super().__init__()
-        # norm1.norm.weight -> LayerNorm weight
         self.norm = nn.LayerNorm(dim, elementwise_affine=True, bias=False)
-        # norm1.linear.{weight, bias} -> projects time embedding to scale/shift
-        # Output dim is 4*dim for (scale1, shift1, scale2, shift2) = but checkpoint shows 7168 = 4*1792
-        # Actually 7168/1024 = 7, so it's from time_embed_dim to some multiple
-        # Looking at checkpoint: norm1.linear.weight: [7168, 1024], norm1.linear.bias: [7168]
-        # 7168 = 4 * 1792 (scale_self, shift_self, gate_self, gate_cross... or similar)
         self.linear = nn.Linear(time_embed_dim, dim * 4, bias=True)
+
+    def forward(self, x, temb):
+        chunks = self.linear(F.silu(temb)).unsqueeze(1).chunk(4, dim=-1)
+        shift, scale, gate_sa, gate_ff = chunks
+        x = self.norm(x) * (1 + scale) + shift
+        return x, gate_sa, gate_ff
 
 
 class DiTLayer(nn.Module):
@@ -297,8 +324,8 @@ class DiTLayer(nn.Module):
 
     def __init__(self, dim: int, ffn_dim: int, time_embed_dim: int, num_heads: int):
         super().__init__()
-        self.attn1 = DiTSelfAttention(dim)
-        self.attn2 = DiTCrossAttention(dim)
+        self.attn1 = DiTSelfAttention(dim, num_heads)
+        self.attn2 = DiTCrossAttention(dim, num_heads)
         self.feed_forward = DiTFeedForward(dim, ffn_dim)
         self.norm1 = DiTAdaLayerNorm(dim, time_embed_dim)
         self.norm1_context = nn.LayerNorm(dim, elementwise_affine=True, bias=False)
@@ -307,19 +334,30 @@ class DiTLayer(nn.Module):
         self.ffn_norm2 = nn.LayerNorm(dim, elementwise_affine=True, bias=False)
         self.gate = nn.Parameter(torch.zeros(num_heads))
 
+    def forward(self, x, temb, context):
+        normed_x, gate_sa, gate_ff = self.norm1(x, temb)
+        x = x + gate_sa * self.attn1(normed_x)
+        context_normed = self.norm1_context(context)
+        x = x + self.attn2(self.norm2(x), context_normed, gate=self.gate)
+        x = x + gate_ff * self.feed_forward(self.ffn_norm2(self.ffn_norm1(x)))
+        return x
+
 
 class DiTTimeCaptionEmbed(nn.Module):
     """Timestep and caption embedding module."""
 
     def __init__(self, dim: int, time_embed_dim: int, timestep_input_dim: int):
         super().__init__()
-        # timestep_embedder projects sinusoidal timestep to time_embed_dim
         self.timestep_embedder = DiTTimestepEmbedder(time_embed_dim, timestep_input_dim)
-        # caption_embedder: LayerNorm + Linear
         self.caption_embedder = nn.ModuleList([
             nn.LayerNorm(dim, elementwise_affine=True),
             nn.Linear(dim, time_embed_dim, bias=True),
         ])
+
+    def forward(self, timestep, caption_pool):
+        t_emb = self.timestep_embedder(timestep)
+        c_emb = self.caption_embedder[1](self.caption_embedder[0](caption_pool))
+        return t_emb + c_emb
 
 
 class DiTTimestepEmbedder(nn.Module):
@@ -328,12 +366,24 @@ class DiTTimestepEmbedder(nn.Module):
         self.linear_1 = nn.Linear(timestep_input_dim, time_embed_dim, bias=True)
         self.linear_2 = nn.Linear(time_embed_dim, time_embed_dim, bias=True)
 
+    def forward(self, t):
+        half_dim = self.linear_1.in_features // 2
+        emb = torch.arange(half_dim, device=t.device, dtype=torch.float32)
+        emb = torch.exp(-emb * (torch.log(torch.tensor(10000.0)) / half_dim))
+        emb = t.float().unsqueeze(-1) * emb.unsqueeze(0)
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+        emb = emb.to(self.linear_1.weight.dtype)
+        return self.linear_2(F.silu(self.linear_1(emb)))
+
 
 class DiTCaptionProjection(nn.Module):
     def __init__(self, in_dim: int, dim: int):
         super().__init__()
         self.linear_1 = nn.Linear(in_dim, dim, bias=True)
         self.linear_2 = nn.Linear(dim, dim, bias=True)
+
+    def forward(self, x):
+        return self.linear_2(F.silu(self.linear_1(x)))
 
 
 class DiTNormOut(nn.Module):
@@ -342,13 +392,19 @@ class DiTNormOut(nn.Module):
         self.linear_1 = nn.Linear(time_embed_dim, dim, bias=True)
         self.linear_2 = nn.Linear(dim, dim, bias=True)
 
+    def forward(self, x, temb):
+        scale = self.linear_1(F.silu(temb)).unsqueeze(1)
+        x = x * (1 + scale)
+        return self.linear_2(x)
+
 
 class DiTPatchEmbedder(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
-        # patch_embedder projects latent_channels (after patchify) to dim
-        # From checkpoint: [1792, 1792] meaning input_dim == output_dim
         self.proj = nn.Linear(dim, dim, bias=True)
+
+    def forward(self, x):
+        return self.proj(x)
 
 
 class DiTModel(nn.Module):
@@ -360,21 +416,33 @@ class DiTModel(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        dim = config.dit_hidden_size
+        self.dim = config.dit_hidden_size
         time_embed_dim = config.dit_time_embed_dim
         timestep_input_dim = config.dit_timestep_input_dim
         ffn_dim = config.dit_ffn_hidden_size
         num_layers = config.dit_num_layers
         num_heads = config.dit_num_heads
 
-        self.patch_embedder = DiTPatchEmbedder(dim)
-        self.time_caption_embed = DiTTimeCaptionEmbed(dim, time_embed_dim, timestep_input_dim)
-        self.caption_projection = DiTCaptionProjection(config.hidden_size, dim)
+        self.patch_embedder = DiTPatchEmbedder(self.dim)
+        self.time_caption_embed = DiTTimeCaptionEmbed(self.dim, time_embed_dim, timestep_input_dim)
+        self.caption_projection = DiTCaptionProjection(config.hidden_size, self.dim)
         self.layers = nn.ModuleList([
-            DiTLayer(dim, ffn_dim, time_embed_dim, num_heads)
+            DiTLayer(self.dim, ffn_dim, time_embed_dim, num_heads)
             for _ in range(num_layers)
         ])
-        self.norm_out = DiTNormOut(dim, time_embed_dim)
+        self.norm_out = DiTNormOut(self.dim, time_embed_dim)
+
+    def forward(self, hidden_states, timestep, encoder_hidden_states):
+        B, C, H, W = hidden_states.shape
+        x = hidden_states.flatten(2).transpose(1, 2)
+        x = self.patch_embedder(x)
+        context = self.caption_projection(encoder_hidden_states)
+        caption_pool = context.mean(dim=1)
+        temb = self.time_caption_embed(timestep, caption_pool)
+        for layer in self.layers:
+            x = layer(x, temb, context)
+        x = self.norm_out(x, temb)
+        return x.transpose(1, 2).reshape(B, C, H, W)
 
 
 class DiTWrapper(nn.Module):
@@ -525,10 +593,19 @@ class VAE(nn.Module):
 
 
 class EVAAttention(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, num_heads: int):
         super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim, bias=True)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        out = F.scaled_dot_product_attention(q, k, v)
+        return self.proj(out.transpose(1, 2).reshape(B, N, C))
 
 
 class EVAMLP(nn.Module):
@@ -537,14 +614,22 @@ class EVAMLP(nn.Module):
         self.fc1 = nn.Linear(dim, mlp_dim, bias=True)
         self.fc2 = nn.Linear(mlp_dim, dim, bias=True)
 
+    def forward(self, x):
+        return self.fc2(F.gelu(self.fc1(x)))
+
 
 class EVABlock(nn.Module):
-    def __init__(self, dim: int, mlp_dim: int):
+    def __init__(self, dim: int, mlp_dim: int, num_heads: int):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=True)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=True)
-        self.attn = EVAAttention(dim)
+        self.attn = EVAAttention(dim, num_heads)
         self.mlp = EVAMLP(dim, mlp_dim)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
 
 
 class EVAModel(nn.Module):
@@ -555,24 +640,37 @@ class EVAModel(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        dim = config.gen_vit_hidden_size
+        self.dim = config.gen_vit_hidden_size
         num_blocks = config.gen_vit_num_blocks
-        mlp_dim = int(dim * config.gen_vit_mlp_ratio)
-        patch_size = config.gen_vit_patch_size
-        # pos_embed: 1025 = (image_size/patch_size)^2 + 1 (cls_token)
-        num_patches = (config.gen_vit_image_size // patch_size) ** 2
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, dim))
-        self.patch_embed = EVAPatchEmbed(dim, patch_size)
+        num_heads = config.gen_vit_num_heads
+        mlp_dim = int(self.dim * config.gen_vit_mlp_ratio)
+        self.patch_size = config.gen_vit_patch_size
+        num_patches = (config.gen_vit_image_size // self.patch_size) ** 2
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, self.dim))
+        self.patch_embed = EVAPatchEmbed(self.dim, self.patch_size)
         self.blocks = nn.ModuleList([
-            EVABlock(dim, mlp_dim) for _ in range(num_blocks)
+            EVABlock(self.dim, mlp_dim, num_heads) for _ in range(num_blocks)
         ])
+
+    def forward(self, pixel_values):
+        B = pixel_values.shape[0]
+        x = self.patch_embed(pixel_values)
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+        x = x + self.pos_embed
+        for block in self.blocks:
+            x = block(x)
+        return x[:, 1:]
 
 
 class EVAPatchEmbed(nn.Module):
     def __init__(self, dim: int, patch_size: int):
         super().__init__()
         self.proj = nn.Conv2d(3, dim, kernel_size=patch_size, stride=patch_size, bias=True)
+
+    def forward(self, x):
+        return self.proj(x).flatten(2).transpose(1, 2)
 
 
 class EVAVisionTower(nn.Module):
@@ -582,6 +680,9 @@ class EVAVisionTower(nn.Module):
         super().__init__()
         self.model = EVAModel(config)
 
+    def forward(self, pixel_values):
+        return self.model(pixel_values)
+
 
 class GenVisionTowerWrapper(nn.Module):
     """Wrapper: gen_vision_tower.vision_tower.* """
@@ -589,6 +690,9 @@ class GenVisionTowerWrapper(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.vision_tower = EVAVisionTower(config)
+
+    def forward(self, pixel_values):
+        return self.vision_tower(pixel_values)
 
 
 # =============================================================================
@@ -671,35 +775,11 @@ class BLIP3oQwenForCausalLM(PreTrainedModel):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
-    def forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        labels=None,
-        pixel_values=None,
-        **kwargs,
-    ):
-        """Training forward pass for BLIP3o.
+    def _llm_forward(self, inputs_embeds):
+        """Run LLM backbone forward with causal attention and RoPE."""
+        device = inputs_embeds.device
+        seq_len = inputs_embeds.shape[1]
 
-        Standard causal LM SFT: embed tokens, forward through decoder layers,
-        compute cross-entropy loss on labeled positions.
-
-        For understanding mode, visual features from the Qwen2.5-VL ViT are
-        injected at image placeholder positions in the input sequence (handled
-        by data collator). For pure language SFT, no pixel_values needed.
-
-        Args:
-            input_ids: [B, seq_len]
-            attention_mask: [B, seq_len]
-            labels: [B, seq_len] with -100 for non-loss tokens
-            pixel_values: optional [B, C, H, W] for understanding
-        """
-        device = input_ids.device
-        batch_size, seq_len = input_ids.shape
-
-        inputs_embeds = self.model.embed_tokens(input_ids)
-
-        # Precompute RoPE embeddings
         head_dim = self.config.hidden_size // self.config.num_attention_heads
         inv_freq = 1.0 / (self.config.rope_theta ** (
             torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim
@@ -707,15 +787,13 @@ class BLIP3oQwenForCausalLM(PreTrainedModel):
         positions = torch.arange(seq_len, device=device, dtype=torch.float32)
         freqs = torch.outer(positions, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        rope_cos = emb.cos()[None, None, :, :]  # [1, 1, S, D]
+        rope_cos = emb.cos()[None, None, :, :]
         rope_sin = emb.sin()[None, None, :, :]
 
-        # Forward through transformer layers with causal attention
         hidden_states = inputs_embeds
         for layer in self.model.layers:
             residual = hidden_states
             hidden_states_norm = layer.input_layernorm(hidden_states)
-            # Self-attention with RoPE
             attn = layer.self_attn
             B, N, D = hidden_states_norm.shape
             q = attn.q_proj(hidden_states_norm).view(B, N, attn.num_heads, attn.head_dim).transpose(1, 2)
@@ -723,14 +801,10 @@ class BLIP3oQwenForCausalLM(PreTrainedModel):
             v = attn.v_proj(hidden_states_norm).view(B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
             q = attn.q_norm(q)
             k = attn.k_norm(k)
-            # Apply rotary position embeddings
             q1, q2 = q[..., : head_dim // 2], q[..., head_dim // 2 :]
-            q_rotated = torch.cat((-q2, q1), dim=-1)
-            q = q * rope_cos + q_rotated * rope_sin
+            q = q * rope_cos + torch.cat((-q2, q1), dim=-1) * rope_sin
             k1, k2 = k[..., : head_dim // 2], k[..., head_dim // 2 :]
-            k_rotated = torch.cat((-k2, k1), dim=-1)
-            k = k * rope_cos + k_rotated * rope_sin
-            # GQA repeat
+            k = k * rope_cos + torch.cat((-k2, k1), dim=-1) * rope_sin
             if attn.num_kv_heads < attn.num_heads:
                 rep = attn.num_heads // attn.num_kv_heads
                 k = k.repeat_interleave(rep, dim=1)
@@ -738,22 +812,105 @@ class BLIP3oQwenForCausalLM(PreTrainedModel):
             attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             attn_out = attn_out.transpose(1, 2).reshape(B, N, -1)
             hidden_states = residual + attn.o_proj(attn_out)
-            # MLP
             residual = hidden_states
             hidden_states = residual + layer.mlp(layer.post_attention_layernorm(hidden_states))
 
-        hidden_states = self.model.norm(hidden_states)
+        return self.model.norm(hidden_states)
+
+    def _encode_gen_features(self, target_images):
+        """Encode target images via gen_vision_tower to DIT-compatible latent features.
+
+        Returns [B, C, H, W] where C=gen_vit_hidden_size (1792).
+        """
+        features = self.model.gen_vision_tower(target_images)
+        B, N, C = features.shape
+        h = w = int(N ** 0.5)
+        features = features.transpose(1, 2).reshape(B, C, h, w)
+        pool_str = self.config.gen_pooling
+        if pool_str.startswith("early_pool2d_"):
+            pool_factor = int(pool_str.split("_")[-1])
+            features = F.avg_pool2d(features, kernel_size=pool_factor, stride=pool_factor)
+        return features
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        labels=None,
+        pixel_values=None,
+        target_images=None,
+        target_latents=None,
+        **kwargs,
+    ):
+        """Training forward pass for BLIP3o.
+
+        Args:
+            input_ids: [B, seq_len]
+            attention_mask: [B, seq_len]
+            labels: [B, seq_len] with -100 for non-loss tokens
+            pixel_values: optional [B, C, H, W] for understanding
+            target_images: optional [B, 3, H, W] images for generation training
+            target_latents: optional [B, C, H, W] pre-encoded DIT latent features
+        """
+        inputs_embeds = self.model.embed_tokens(input_ids)
+        hidden_states = self._llm_forward(inputs_embeds)
         logits = self.lm_head(hidden_states)
 
         loss = None
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            loss = torch.nn.functional.cross_entropy(
+            loss = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
 
+        diff_loss = None
+        if target_images is not None or target_latents is not None:
+            if target_latents is not None:
+                latents = target_latents
+            else:
+                with torch.no_grad():
+                    latents = self._encode_gen_features(target_images)
+
+            noise = torch.randn_like(latents)
+            B = latents.shape[0]
+            u = torch.rand(B, device=latents.device, dtype=latents.dtype)
+            sigmas = u.view(B, 1, 1, 1)
+            noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
+            timesteps = (u * 1000).long()
+
+            start_tag = self.config.vision_start_token_id
+            end_tag = self.config.vision_end_token_id
+            if labels is not None:
+                selected_hidden_states = []
+                for b in range(B):
+                    start_pos = (labels[b] == start_tag).float().argmax().item() + 1
+                    end_pos = (labels[b] == end_tag).float().argmax().item()
+                    hs = hidden_states[b, start_pos:end_pos, :]
+                    if hs.shape[0] < 1:
+                        hs = hidden_states[b, -730:, :]
+                    selected_hidden_states.append(hs)
+                max_len = max(h.shape[0] for h in selected_hidden_states)
+                padded = torch.zeros(B, max_len, hidden_states.shape[-1],
+                                     device=hidden_states.device, dtype=hidden_states.dtype)
+                for b, hs in enumerate(selected_hidden_states):
+                    padded[b, :hs.shape[0]] = hs
+                encoder_hidden_states = padded
+            else:
+                encoder_hidden_states = hidden_states[:, -730:, :]
+
+            dit = self.model.dit.model
+            diffusion_pred = dit(noisy_latents, timesteps, encoder_hidden_states)
+
+            target = noise - latents
+            diff_loss = ((diffusion_pred.float() - target.float()) ** 2).mean()
+
+            if loss is not None:
+                loss = loss + diff_loss
+            else:
+                loss = diff_loss
+
         from types import SimpleNamespace
-        return SimpleNamespace(loss=loss, logits=logits)
+        return SimpleNamespace(loss=loss, logits=logits, diff_loss=diff_loss)

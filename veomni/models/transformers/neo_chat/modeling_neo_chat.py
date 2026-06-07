@@ -864,6 +864,9 @@ class NEOChatModel(PreTrainedModel):
         self.max_shift = config.max_shift
         self.base_image_seq_len = config.base_image_seq_len
         self.max_image_seq_len = config.max_image_seq_len
+        self.t_eps = config.t_eps
+        self.P_mean = config.P_mean
+        self.P_std = config.P_std
 
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
@@ -928,24 +931,73 @@ class NEOChatModel(PreTrainedModel):
             vit_features = self.extract_feature(pixel_values, gen_model=False, grid_hw=grid_hw)
 
         # Process generation images (noisy target for flow-matching loss)
+        # Official (SenseNova-U1 training/sensenovavl):
+        #   1. Create noise in pixel space, interpolate: z = t*x + (1-t)*noise
+        #   2. Merge patches: [h,w] -> [h/m, w/m] with m=merge_size
+        #   3. Pass noisy pixels through gen ViT -> features for LLM
+        #   4. fm_head predicts in merged pixel space
+        #   5. v = (x - z)/(1-t), pred_v = (pred_x - z_merged)/(1-t)
+        #   6. loss = MSE(pred_v, v)
         fm_loss = None
-        noise = None
-        gen_features = None
+        image_gen_x = None
+        image_gen_z = None
+        image_gen_t = None
         if gen_pixel_values is not None and timesteps is not None and image_gen_indicators is not None:
-            gen_features = self.extract_feature(gen_pixel_values, gen_model=True, grid_hw=gen_grid_hw)
+            merge_size = int(1 / self.downsample_ratio)
+            patch_size = self.patch_size
+            ps_merged = patch_size * merge_size
 
-            t_emb = self.fm_modules["timestep_embedder"](timesteps)
+            noise = torch.randn_like(gen_pixel_values)
+            if self.noise_scale != 1.0:
+                noise = noise * self.noise_scale
 
-            noise = torch.randn_like(gen_features)
-            t = timesteps.view(-1, 1, 1) if timesteps.dim() == 1 else timesteps
-            noisy_features = (1 - t) * gen_features + t * noise
+            t = timesteps.view(-1, 1) if timesteps.dim() == 1 else timesteps
+            noisy_pixels = t * gen_pixel_values + (1 - t) * noise
+
+            # Pass noisy pixels through gen ViT to get LLM-space features
+            gen_features = self.extract_feature(noisy_pixels, gen_model=True, grid_hw=gen_grid_hw)
 
             gen_mask = image_gen_indicators.bool()
             if gen_mask.any():
-                flat_gen = noisy_features.reshape(-1, noisy_features.shape[-1])
+                flat_gen = gen_features.reshape(-1, gen_features.shape[-1])
                 num_gen_tokens = gen_mask.sum().item()
                 if flat_gen.shape[0] >= num_gen_tokens:
                     inputs_embeds[gen_mask] = flat_gen[:num_gen_tokens]
+
+            # Merge pixel patches for FM target (pixel space, post-merge)
+            # gen_pixel_values: [N_patches, 3*p*p] -> merge into [N_merged, ps_merged^2*3]
+            def _merge_patches(pv, grid_hw_t):
+                merged = []
+                cur = 0
+                for i in range(grid_hw_t.shape[0]):
+                    h, w = int(grid_hw_t[i, 0]), int(grid_hw_t[i, 1])
+                    n = h * w
+                    img = pv[cur:cur + n].view(h, w, 3, patch_size, patch_size)
+                    img = img.view(h // merge_size, merge_size, w // merge_size, merge_size, 3, patch_size, patch_size)
+                    img = torch.einsum("h a w b c i j -> h w a i b j c", img).contiguous()
+                    img = img.view(-1, ps_merged ** 2 * 3)
+                    merged.append(img)
+                    cur += n
+                return torch.cat(merged, dim=0)
+
+            image_gen_x = _merge_patches(gen_pixel_values, gen_grid_hw)
+            image_gen_z = _merge_patches(noisy_pixels, gen_grid_hw)
+            # Per-merged-token timesteps
+            num_merged = image_gen_x.shape[0]
+            image_gen_t = timesteps.expand(num_merged)
+
+        # Add timestep + noise_scale embedding to generation token positions
+        if image_gen_t is not None and image_gen_indicators is not None:
+            gen_mask = image_gen_indicators.bool()
+            if gen_mask.any():
+                t_emb = self.fm_modules["timestep_embedder"](image_gen_t)
+                if self.add_noise_scale_embedding and "noise_scale_embedder" in self.fm_modules:
+                    ns_val = torch.full_like(image_gen_t, self.noise_scale / self.noise_scale_max_value)
+                    ns_emb = self.fm_modules["noise_scale_embedder"](ns_val)
+                    t_emb = t_emb + ns_emb
+                num_gen_tokens = gen_mask.sum().item()
+                if t_emb.shape[0] >= num_gen_tokens:
+                    inputs_embeds[gen_mask] = inputs_embeds[gen_mask] + t_emb[:num_gen_tokens]
 
         # Build 4D causal attention mask from 2D padding mask
         # attention code expects [B, 1, S, S] additive mask (0 = attend, -inf = mask)
@@ -983,14 +1035,19 @@ class NEOChatModel(PreTrainedModel):
             )
 
         # Flow-matching loss for generation tokens
-        if gen_pixel_values is not None and image_gen_indicators is not None and noise is not None:
+        # Official: pred_x = fm_head(hidden), pred_v = (pred_x - z)/(1-t),
+        #           target_v = (x - z)/(1-t), loss = MSE(pred_v, target_v)
+        if image_gen_x is not None and image_gen_z is not None and image_gen_t is not None:
             gen_mask = image_gen_indicators.bool()
             if gen_mask.any():
                 gen_hidden = hidden_states[gen_mask]
-                fm_pred = self.fm_modules["fm_head"](gen_hidden)
-                target = (noise - gen_features).reshape(-1, fm_pred.shape[-1])
-                num_gen = min(fm_pred.shape[0], target.shape[0])
-                fm_loss = torch.nn.functional.mse_loss(fm_pred[:num_gen], target[:num_gen])
+                fm_pred_x = self.fm_modules["fm_head"](gen_hidden)
+                num_gen = min(fm_pred_x.shape[0], image_gen_x.shape[0])
+                t_col = image_gen_t[:num_gen].view(-1, 1)
+                denom = (1 - t_col).clamp_min(self.t_eps)
+                pred_v = (fm_pred_x[:num_gen] - image_gen_z[:num_gen]) / denom
+                target_v = (image_gen_x[:num_gen] - image_gen_z[:num_gen]) / denom
+                fm_loss = torch.nn.functional.mse_loss(pred_v, target_v)
 
         # Combine losses
         loss = None
