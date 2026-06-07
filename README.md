@@ -8,7 +8,7 @@
 > | [Bagel](https://github.com/ByteDance-Seed/Bagel) | `bagel` | Qwen2.5-7B | MoVQGAN (Flow-Matching) | 14.6B |
 > | [ThinkMorph](https://github.com/ThinkMorph/ThinkMorph) | `thinkmorph` | Qwen2.5-7B | MoVQGAN (Flow-Matching + CoT) | 14.6B |
 > | [BLIP3o](https://github.com/JiuhaiChen/BLIP3o) | `blip3o_qwen` | Qwen2.5-7B | Diffusion (DIT + VAE) | 14.1B |
-> | [SenseNova-U1](https://github.com/OpenSenseNova/SenseNova-U1) | `neo_chat` | Qwen3 (42L, dense) | Flow-Matching (MoT) | 17.6B |
+> | [SenseNova-U1](https://github.com/OpenSenseNova/SenseNova-U1) | `neo_chat` | NEO (Qwen3-arch, 42L) | Flow-Matching (MoT) | 17.6B |
 > | [LatentUM](https://github.com/SJTU-DENG-Lab/LatentUM) | `latentum` | InternVL3.5-4B | MoT Discrete Tokens (AR Head) | 8.8B |
 >
 > **Inference Alignment (validated against official implementations):**
