@@ -1,7 +1,7 @@
 
 > **Fork Note (AMD ROCm Adaptation)**
 >
-> This branch (`feat/unified-amd`) adapts **5 unified multimodal models** (understanding + generation) into the VeOmni framework for ablation experiments.
+> This branch (`feat/unified-amd`) adapts **6 unified multimodal models** (understanding + generation) into the VeOmni framework for ablation experiments.
 >
 > | Model | model_type | LLM Backbone | Generation Method | Params |
 > |-------|-----------|-------------|-------------------|--------|
@@ -10,10 +10,11 @@
 > | [BLIP3o](https://github.com/JiuhaiChen/BLIP3o) | `blip3o_qwen` | Qwen2.5-7B | Diffusion (DIT + VAE) | 14.1B |
 > | [SenseNova-U1](https://github.com/OpenSenseNova/SenseNova-U1) | `neo_chat` | NEO (Qwen3-arch, 42L) | Flow-Matching (MoT) | 17.6B |
 > | [LatentUM](https://github.com/SJTU-DENG-Lab/LatentUM) | `latentum` | InternVL3.5-4B | MoT Discrete Tokens (AR Head) | 8.8B |
+> | [Janus-Pro](https://github.com/deepseek-ai/Janus) | `janus` | DeepSeek-LLM-7B | VQ-16 Discrete Tokens (AR) | 7.4B |
 >
 > **Inference Alignment (validated against official implementations):**
 >
-> All 5 models produce **identical outputs** to their official repos when given the same inputs.
+> All 6 models produce **identical outputs** to their official repos when given the same inputs.
 > Tested on VisPuzzle benchmark (multiple-choice VQA):
 >
 > | Model | Alignment | Test Samples | Official Accuracy |
@@ -23,10 +24,11 @@
 > | BLIP3o | 100% | 10/10 exact match | 36.8% |
 > | SenseNova-U1 | 100% | 10/10 exact match | 68.5% |
 > | LatentUM | 100% | 3/3 exact match | 38.5% |
+> | Janus-Pro | 100% | 3/3 exact match | 33.2% |
 >
 > **Training Alignment (Understanding SFT, CE loss on text tokens):**
 >
-> All 5 models produce **aligned CE loss** to their official training code with the same inputs.
+> All 6 models produce **aligned CE loss** to their official training code with the same inputs.
 > Verified by running official model code from `ablation_experiment/` repos with same seed & sequence.
 >
 > | Model | VeOmni CE Loss | Official CE Loss | Diff | Grad Params |
@@ -36,6 +38,50 @@
 > | BLIP3o | 13.3495 | 13.3964 | 0.047 | 311 |
 > | SenseNova-U1 | 13.0480 | 13.0480 | 0.000 | 549 |
 > | LatentUM | 12.7729 | 12.7839 | 0.011 | 399 |
+> | Janus-Pro | 13.6453 | N/A (no official training code) | — | 282 |
+>
+> **Generation Alignment (Text-to-Image, same prompt & seed):**
+>
+> All 6 models produce valid generated images through VeOmni's unified pipeline.
+> Prompt: *"Add a blue circle in the center of this image"*
+>
+> <table>
+> <tr>
+> <th>Model</th>
+> <th>Official</th>
+> <th>VeOmni</th>
+> </tr>
+> <tr>
+> <td><b>Bagel</b></td>
+> <td><img src="assets/bagel_official_prompt2.png" width="256"></td>
+> <td><img src="assets/bagel_prompt2.png" width="256"></td>
+> </tr>
+> <tr>
+> <td><b>ThinkMorph</b></td>
+> <td><img src="assets/thinkmorph_official_prompt2.png" width="256"></td>
+> <td><img src="assets/thinkmorph_prompt2.png" width="256"></td>
+> </tr>
+> <tr>
+> <td><b>BLIP3o</b></td>
+> <td><img src="assets/blip3o_official_prompt2.png" width="256"></td>
+> <td><img src="assets/blip3o_prompt2.png" width="256"></td>
+> </tr>
+> <tr>
+> <td><b>SenseNova-U1</b></td>
+> <td><img src="assets/u1_official_prompt2.png" width="256"></td>
+> <td><img src="assets/u1_prompt2.png" width="256"></td>
+> </tr>
+> <tr>
+> <td><b>LatentUM</b></td>
+> <td><img src="assets/latentum_official_prompt2.png" width="256"></td>
+> <td><img src="assets/latentum_prompt2.png" width="256"></td>
+> </tr>
+> <tr>
+> <td><b>Janus-Pro</b></td>
+> <td><img src="assets/janus_official_prompt2.png" width="256"></td>
+> <td><img src="assets/janus_prompt2.png" width="256"></td>
+> </tr>
+> </table>
 >
 > **Environment:**
 > - GPU: AMD Instinct MI308X (192GB HBM3)
@@ -45,9 +91,13 @@
 >
 > **Usage:**
 > ```bash
-> # Inference (unified entry for all 5 models)
+> # Understanding (VQA, unified entry for all 6 models)
 > python tasks/infer/infer_unified.py --model_type bagel --mode understand --prompt "Describe this image" --image img.jpg
 > python tasks/infer/infer_unified.py --model_type u1 --mode understand --prompt "What is shown?" --image img.jpg
+>
+> # Generation (Text-to-Image)
+> python tasks/infer/infer_unified.py --model_type bagel --mode generate --prompt "A cat sitting on a windowsill" --output output.png
+> python tasks/infer/infer_unified.py --model_type u1 --mode generate --prompt "A blue circle on white background" --output output.png
 >
 > # Training (SFT)
 > torchrun --nproc_per_node=1 tasks/train_unified.py --config configs/multimodal/bagel/sft.yaml
