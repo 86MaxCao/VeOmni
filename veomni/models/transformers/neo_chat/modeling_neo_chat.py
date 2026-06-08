@@ -14,15 +14,45 @@ enabling both temporal (causal text) and spatial (image patch) position awarenes
 
 import copy
 import math
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torchvision.transforms as T
+from PIL import Image
 from transformers.activations import ACT2FN
+from transformers.cache_utils import DynamicCache
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 
 from .configuration_neo_chat import NEOChatConfig, NEOLLMConfig, NEOVisionConfig
+
+# ---------------------------------------------------------------------------
+# Constants for generation inference
+# ---------------------------------------------------------------------------
+
+SYSTEM_MESSAGE_FOR_GEN = (
+    "You are an image generation and editing assistant that accurately understands and executes "
+    "user intent.\n\nYou support two modes:\n\n1. Think Mode:\nIf the task requires reasoning, you "
+    "MUST start with a <think></think> block. Put all reasoning inside the block using plain text. "
+    "DO NOT include any image tags. Keep it reasonable and directly useful for producing the final "
+    "image.\n\n2. Non-Think Mode:\nIf no reasoning is needed, directly produce the final image.\n\n"
+    "Task Types:\n\nA. Text-to-Image Generation:\n"
+    "- Generate a high-quality image based on the user's description.\n"
+    "- Ensure visual clarity, semantic consistency, and completeness.\n"
+    "- DO NOT introduce elements that contradict or override the user's intent.\n\n"
+    "B. Image Editing:\n"
+    "- Use the provided image(s) as input or reference for modification or transformation.\n"
+    "- The result can be an edited image or a new image based on the reference(s).\n"
+    "- Preserve all unspecified attributes unless explicitly changed.\n\n"
+    "General Rules:\n"
+    "- For any visible text in the image, follow the language specified for the rendered text in "
+    "the user's description, not the language of the prompt. If no language is specified, use the "
+    "user's input language."
+)
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 try:
     from flash_attn import flash_attn_func
@@ -98,6 +128,145 @@ def _build_abs_positions_from_grid_hw(grid_hw, device=None):
     return abs_x, abs_y
 
 
+# ---------------------------------------------------------------------------
+# Generation inference helpers
+# ---------------------------------------------------------------------------
+
+
+def create_block_causal_mask(index: torch.Tensor):
+    """Create block-wise causal attention mask from temporal index tensor.
+
+    Args:
+        index: (L,) temporal index for each token.
+    Returns:
+        (1, 1, L, L) mask: 0 where attention allowed, -inf where blocked.
+    """
+    L = index.size(0)
+    idx_i = index.unsqueeze(1).expand(L, L)
+    idx_j = index.unsqueeze(0).expand(L, L)
+    arange = torch.arange(L, device=index.device)
+    mask = (idx_j == idx_i) | (arange.unsqueeze(0) <= arange.unsqueeze(1))
+    return torch.where(mask[None, None, :, :] > 0, torch.tensor(0.0, device=index.device), torch.tensor(float("-inf"), device=index.device))
+
+
+def prepare_flash_kv_cache(past_key_values, current_len: int, batch_size: int):
+    """Convert prefix KV cache to flash-attn layout and preallocate buffers.
+
+    Stores flash caches as ``_flash_k_caches`` / ``_flash_v_caches`` on the
+    DynamicCache object.  Called once before the denoising loop.
+    """
+    if past_key_values is None:
+        return
+    num_layers = len(past_key_values.layers)
+    flash_k = []
+    flash_v = []
+    flash_prefix = []
+    for li in range(num_layers):
+        past_k = past_key_values.layers[li].keys
+        past_v = past_key_values.layers[li].values
+        if past_k.numel() == 0:
+            flash_k.append(None)
+            flash_v.append(None)
+            flash_prefix.append(0)
+            continue
+        pk = past_k.transpose(1, 2).contiguous()  # [B, S, H, D]
+        pv = past_v.transpose(1, 2).contiguous()
+        prefix_len = pk.shape[1]
+        total_len = prefix_len + current_len
+        kc = torch.empty((batch_size, total_len, pk.shape[2], pk.shape[3]), device=pk.device, dtype=pk.dtype)
+        vc = torch.empty((batch_size, total_len, pv.shape[2], pv.shape[3]), device=pv.device, dtype=pv.dtype)
+        kc[:, :prefix_len].copy_(pk)
+        vc[:, :prefix_len].copy_(pv)
+        flash_k.append(kc)
+        flash_v.append(vc)
+        flash_prefix.append(prefix_len)
+    past_key_values._flash_k_caches = flash_k
+    past_key_values._flash_v_caches = flash_v
+    past_key_values._flash_prefix_lens = flash_prefix
+
+
+def clear_flash_kv_cache(past_key_values):
+    """Remove preallocated flash KV buffers after denoising."""
+    if past_key_values is None:
+        return
+    for attr in ("_flash_k_caches", "_flash_v_caches", "_flash_prefix_lens"):
+        if hasattr(past_key_values, attr):
+            delattr(past_key_values, attr)
+
+
+def _round_by_factor(number: float, factor: int) -> int:
+    return round(number / factor) * factor
+
+
+def _ceil_by_factor(number: float, factor: int) -> int:
+    return math.ceil(number / factor) * factor
+
+
+def _floor_by_factor(number: float, factor: int) -> int:
+    return math.floor(number / factor) * factor
+
+
+def _smart_resize(
+    height: int,
+    width: int,
+    factor: int = 32,
+    min_pixels: int = 65536,
+    max_pixels: int = 4194304,
+) -> Tuple[int, int]:
+    if max(height, width) / min(height, width) > 200:
+        raise ValueError(f"aspect ratio too large: {max(height, width) / min(height, width)}")
+    h_bar = max(factor, _round_by_factor(height, factor))
+    w_bar = max(factor, _round_by_factor(width, factor))
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = max(factor, _floor_by_factor(height / beta, factor))
+        w_bar = max(factor, _floor_by_factor(width / beta, factor))
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = _ceil_by_factor(height * beta, factor)
+        w_bar = _ceil_by_factor(width * beta, factor)
+    return h_bar, w_bar
+
+
+def load_image_native(
+    image,
+    patch_size: int = 16,
+    downsample_ratio: float = 0.5,
+    min_pixels: int = 65536,
+    max_pixels: int = 4194304,
+    upscale: bool = False,
+):
+    """Load and preprocess image: RGB convert → smart-resize → normalize → patchify."""
+    if not isinstance(image, Image.Image):
+        image = Image.open(image)
+    if image.mode == "RGBA":
+        bg = Image.new("RGB", image.size, (255, 255, 255))
+        bg.paste(image, mask=image.split()[3])
+        image = bg
+    image = image.convert("RGB")
+    if upscale:
+        image = image.resize((image.width * 2, image.height * 2), Image.BILINEAR)
+
+    size_factor = int(patch_size // downsample_ratio)
+    w, h = image.size
+    rh, rw = _smart_resize(h, w, factor=size_factor, min_pixels=min_pixels, max_pixels=max_pixels)
+    image = image.resize((rw, rh))
+
+    transform = T.Compose([T.ToTensor(), T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)])
+    pixel_values = transform(image).to(torch.float32)
+
+    c, ph, pw = pixel_values.shape
+    grid_h = ph // patch_size
+    grid_w = pw // patch_size
+    flatten_pv = (
+        pixel_values.view(c, grid_h, patch_size, grid_w, patch_size)
+        .permute(1, 3, 0, 2, 4)
+        .reshape(grid_h * grid_w, c * patch_size ** 2)
+    )
+    grid_hw = torch.tensor([[grid_h, grid_w]])
+    return flatten_pv, grid_hw
+
+
 def _apply_rotary_emb_1d(x, cos_cached, sin_cached, positions):
     """Apply 1D RoPE to input tensor."""
     cos = cos_cached[positions]
@@ -165,8 +334,12 @@ class NEOVisionEmbeddings(nn.Module):
         self.register_buffer("sin_cached_y", sin_y, persistent=False)
 
     def _ensure_rope_buffers(self, device: torch.device) -> None:
-        """Reinitialise RoPE cos/sin buffers if they were zeroed by meta-device loading."""
-        if self.cos_cached_x is not None and self.cos_cached_x.abs().sum() > 0:
+        """Reinitialise RoPE cos/sin buffers if they were zeroed or corrupted by meta-device loading."""
+        if (
+            self.cos_cached_x is not None
+            and self.cos_cached_x.abs().sum() > 0
+            and self.cos_cached_x.abs().max() <= 1.0
+        ):
             return
         cos_x, sin_x = _precompute_rope_freqs_sincos(
             self.rope_dim_part,
@@ -537,18 +710,61 @@ class Qwen3Attention(nn.Module):
         query_states = torch.cat([query_states_t, query_states_h, query_states_w], dim=-1)
         key_states = torch.cat([key_states_t, key_states_h, key_states_w], dim=-1)
 
-        if past_key_values is not None:
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+        update_cache = kwargs.get("update_cache", True)
 
         # Flash attention path for generation (bidirectional within image block)
         if attention_mask is None:
             q = query_states.transpose(1, 2).contiguous()
-            k = key_states.transpose(1, 2).contiguous()
-            v = value_states.transpose(1, 2).contiguous()
+            k_cur = key_states.transpose(1, 2).contiguous()
+            v_cur = value_states.transpose(1, 2).contiguous()
+
+            if past_key_values is not None:
+                if update_cache:
+                    key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+                    k = key_states.transpose(1, 2).contiguous()
+                    v = value_states.transpose(1, 2).contiguous()
+                else:
+                    if (
+                        hasattr(past_key_values, "_flash_k_caches")
+                        and past_key_values._flash_k_caches[self.layer_idx] is not None
+                    ):
+                        prefix_len = past_key_values._flash_prefix_lens[self.layer_idx]
+                        cur_len = k_cur.shape[1]
+                        past_key_values._flash_k_caches[self.layer_idx][:, prefix_len : prefix_len + cur_len].copy_(k_cur)
+                        past_key_values._flash_v_caches[self.layer_idx][:, prefix_len : prefix_len + cur_len].copy_(v_cur)
+                        k = past_key_values._flash_k_caches[self.layer_idx][:, : prefix_len + cur_len]
+                        v = past_key_values._flash_v_caches[self.layer_idx][:, : prefix_len + cur_len]
+                    else:
+                        layer_cache = past_key_values.layers[self.layer_idx]
+                        past_k = layer_cache.keys
+                        past_v = layer_cache.values
+                        if past_k.numel() > 0:
+                            pk = past_k.transpose(1, 2).contiguous()
+                            pv = past_v.transpose(1, 2).contiguous()
+                            k = torch.cat([pk, k_cur], dim=1)
+                            v = torch.cat([pv, v_cur], dim=1)
+                        else:
+                            k = k_cur
+                            v = v_cur
+            else:
+                k = k_cur
+                v = v_cur
+
             attn_output = _flash_or_sdpa(q, k, v, dropout_p=0.0, softmax_scale=self.scaling, causal=False)
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         else:
             # Eager fallback with mask
+            if past_key_values is not None:
+                if update_cache:
+                    key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+                else:
+                    layer_cache = past_key_values.layers[self.layer_idx]
+                    past_k = layer_cache.keys
+                    past_v = layer_cache.values
+                    if past_k.numel() > 0:
+                        key_states = torch.cat([past_k, key_states], dim=2)
+                        value_states = torch.cat([past_v, value_states], dim=2)
+
             key_states_expanded = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
             value_states_expanded = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
             attn_weights = torch.matmul(query_states, key_states_expanded.transpose(2, 3)) * self.scaling
@@ -1063,3 +1279,385 @@ class NEOChatModel(PreTrainedModel):
             logits=self.language_model.lm_head(hidden_states) if labels is None else None,
             hidden_states=hidden_states,
         )
+
+    # ------------------------------------------------------------------
+    # Generation inference helpers
+    # ------------------------------------------------------------------
+
+    def patchify(self, images, patch_size, channel_first=False):
+        """images: (N, 3, H, W) → (N, L, patch_size²*3)"""
+        h, w = images.shape[2] // patch_size, images.shape[3] // patch_size
+        x = images.reshape(images.shape[0], 3, h, patch_size, w, patch_size)
+        if channel_first:
+            x = torch.einsum("nchpwq->nhwcpq", x)
+        else:
+            x = torch.einsum("nchpwq->nhwpqc", x)
+        return x.reshape(images.shape[0], h * w, patch_size ** 2 * 3)
+
+    def unpatchify(self, x, patch_size, h=None, w=None):
+        """x: (N, L, patch_size²*3) → (N, 3, H, W)"""
+        if h is None or w is None:
+            h = w = int(x.shape[1] ** 0.5)
+        else:
+            h = h // patch_size
+            w = w // patch_size
+        x = x.reshape(x.shape[0], h, w, patch_size, patch_size, 3)
+        x = torch.einsum("nhwpqc->nchpwq", x)
+        return x.reshape(x.shape[0], 3, h * patch_size, w * patch_size)
+
+    def _apply_time_schedule(self, t: torch.Tensor, image_seq_len: int, timestep_shift: float) -> torch.Tensor:
+        sigma = 1 - t
+        shift = timestep_shift
+        sigma = shift * sigma / (1 + (shift - 1) * sigma)
+        return 1 - sigma
+
+    def _build_t2i_query(self, prompt_text, system_message=None, append_text=None):
+        sys_msg = system_message if system_message is not None else ""
+        parts = []
+        if sys_msg:
+            parts.append(f"<|im_start|>system\n{sys_msg}<|im_end|>\n")
+        parts.append(f"<|im_start|>user\n{prompt_text}<|im_end|>\n")
+        parts.append("<|im_start|>assistant\n")
+        result = "".join(parts)
+        if append_text:
+            result += append_text
+        return result
+
+    def _build_t2i_image_indexes(self, token_h, token_w, text_len, device):
+        n = token_h * token_w
+        t_image = torch.full((n,), text_len, dtype=torch.long, device=device)
+        idx = torch.arange(n, device=device, dtype=torch.long)
+        h_image = idx // token_w
+        w_image = idx % token_w
+        return torch.stack([t_image, h_image, w_image], dim=0)
+
+    def get_thw_indexes(self, input_ids, grid_hw=None):
+        img_start_shift = torch.cat(
+            [torch.zeros(1, dtype=torch.long, device=input_ids.device), (input_ids == self.img_start_token_id).long()],
+            dim=0,
+        )[:-1]
+        not_img_token = (input_ids != self.img_context_token_id).long()
+        t_indexes = (img_start_shift + not_img_token).cumsum(0) - 1
+        h_indexes = torch.zeros_like(t_indexes)
+        w_indexes = torch.zeros_like(t_indexes)
+
+        if grid_hw is not None:
+            selected = input_ids == self.img_context_token_id
+            if selected.long().sum() > 0:
+                abs_pos_w, abs_pos_h = _build_abs_positions_from_grid_hw(
+                    grid_hw // int(1 / self.downsample_ratio), device=t_indexes.device
+                )
+                h_indexes[selected] = abs_pos_h.to(t_indexes.device, t_indexes.dtype)
+                w_indexes[selected] = abs_pos_w.to(t_indexes.device, t_indexes.dtype)
+        return torch.stack([t_indexes, h_indexes, w_indexes], dim=0)
+
+    def _build_it2i_inputs(self, tokenizer, query, pixel_values=None, grid_hw=None):
+        model_inputs = tokenizer(query, return_tensors="pt")
+        input_ids = model_inputs["input_ids"].to(self.device)
+        indexes = self.get_thw_indexes(input_ids[0], grid_hw)
+        attention_mask = create_block_causal_mask(indexes[0])
+
+        input_embeds = self.language_model.get_input_embeddings()(input_ids)
+        B, N, C = input_embeds.shape
+        if pixel_values is not None:
+            vit_embeds = self.extract_feature(pixel_values, grid_hw=grid_hw)
+            input_embeds = input_embeds.reshape(B * N, C)
+            input_ids_flat = input_ids.reshape(B * N)
+            selected = input_ids_flat == self.img_context_token_id
+            assert selected.sum() != 0
+            input_embeds[selected] = vit_embeds.reshape(-1, C).to(input_embeds.device)
+            input_embeds = input_embeds.reshape(B, N, C)
+
+        return input_embeds, indexes, attention_mask
+
+    def _it2i_prefix_forward(self, input_embeds, indexes, attention_mask):
+        past_key_values = DynamicCache()
+        out = self.language_model.model(
+            inputs_embeds=input_embeds,
+            indexes=indexes,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        return out.past_key_values, out.last_hidden_state
+
+    def _t2i_predict_v(self, input_embeds, indexes_image, past_key_values, t, z, image_token_num, image_size=None):
+        B, L = z.shape[0], z.shape[1]
+        outputs = self.language_model.model(
+            inputs_embeds=input_embeds,
+            image_gen_indicators=torch.ones(
+                (input_embeds.shape[0], input_embeds.shape[1]), dtype=torch.bool, device=input_embeds.device
+            ),
+            indexes=indexes_image,
+            attention_mask=None,
+            past_key_values=past_key_values,
+            update_cache=False,
+            use_cache=True,
+        )
+
+        if self.use_deep_fm_head:
+            x_pred = self.fm_modules["fm_head"](
+                outputs.last_hidden_state[:, -image_token_num:].view(B * L, -1), t.repeat(B * L)
+            ).view(B, L, -1)
+        else:
+            x_pred = self.fm_modules["fm_head"](
+                outputs.last_hidden_state[:, -image_token_num:].view(B, L, -1)
+            ).view(B, L, -1)
+
+        v_pred = (x_pred - z) / (1 - t).clamp_min(self.t_eps)
+        return v_pred
+
+    @torch.no_grad()
+    def it2i_generate(
+        self,
+        tokenizer,
+        prompt,
+        images,
+        cfg_scale=1,
+        img_cfg_scale=1,
+        cfg_norm="none",
+        enable_timestep_shift=True,
+        timestep_shift=1,
+        image_size=(256, 256),
+        num_steps=30,
+        IMG_START_TOKEN="<img>",
+        IMG_END_TOKEN="</img>",
+        IMG_CONTEXT_TOKEN="<IMG_CONTEXT>",
+        method="euler",
+        cfg_interval=(0, 1),
+        batch_size=1,
+        t_eps=0.02,
+        think_mode=False,
+        seed=0,
+    ):
+        assert cfg_norm in ("none", "global", "channel")
+
+        self.img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+        self.img_start_token_id = tokenizer.convert_tokens_to_ids(IMG_START_TOKEN)
+        self.t_eps = t_eps
+
+        image_token_count = prompt.count("<image>")
+        assert len(images) >= image_token_count
+        if len(images) > image_token_count:
+            if image_token_count == 0 and len(images) > 1:
+                prompt = "".join(f"Image-{i + 1}:<image>\n" for i in range(len(images))) + prompt
+            else:
+                prompt = "<image>\n" * (len(images) - image_token_count) + prompt
+
+        pixel_values = []
+        grid_hw = []
+        for image in images:
+            cur_pv, cur_ghw = load_image_native(
+                image,
+                self.patch_size,
+                self.downsample_ratio,
+                min_pixels=512 * 512,
+                max_pixels=min(2048 * 2048, (4096 * 4096) // len(images)),
+                upscale=False,
+            )
+            pixel_values.append(cur_pv.to(self.device).to(torch.bfloat16))
+            grid_hw.append(cur_ghw.to(self.device))
+        pixel_values = torch.cat(pixel_values)
+        grid_hw = torch.cat(grid_hw)
+
+        merge_size = int(1 / self.downsample_ratio)
+        needs_cfg = not (cfg_scale == 1 and img_cfg_scale == 1)
+        needs_img_condition = needs_cfg and (img_cfg_scale == 1 or cfg_scale != img_cfg_scale)
+        needs_uncondition = needs_cfg and img_cfg_scale != 1
+
+        think_content = "<think>\n" if think_mode else "<think>\n\n</think>\n\n" + IMG_START_TOKEN
+        query_condition = self._build_t2i_query(prompt, system_message=SYSTEM_MESSAGE_FOR_GEN, append_text=think_content)
+        query_img_condition = (
+            self._build_t2i_query("<image>" * len(images), append_text=IMG_START_TOKEN)
+            if needs_img_condition
+            else None
+        )
+        query_uncondition = self._build_t2i_query("", append_text=IMG_START_TOKEN) if needs_uncondition else None
+
+        for i in range(grid_hw.shape[0]):
+            num_patch_token = int(grid_hw[i, 0] * grid_hw[i, 1] * self.downsample_ratio ** 2)
+            image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * num_patch_token + IMG_END_TOKEN
+            query_condition = query_condition.replace("<image>", image_tokens, 1)
+            if query_img_condition is not None:
+                query_img_condition = query_img_condition.replace("<image>", image_tokens, 1)
+
+        input_embeds_condition, indexes_condition, attn_mask_condition = self._build_it2i_inputs(
+            tokenizer, query_condition, pixel_values, grid_hw
+        )
+        if query_img_condition is not None:
+            input_embeds_img_cond, indexes_img_cond, attn_mask_img_cond = self._build_it2i_inputs(
+                tokenizer, query_img_condition, pixel_values, grid_hw
+            )
+        else:
+            input_embeds_img_cond = indexes_img_cond = attn_mask_img_cond = None
+        if query_uncondition is not None:
+            input_embeds_uncond, indexes_uncond, attn_mask_uncond = self._build_it2i_inputs(
+                tokenizer, query_uncondition
+            )
+        else:
+            input_embeds_uncond = indexes_uncond = attn_mask_uncond = None
+
+        token_h = image_size[1] // (self.patch_size * merge_size)
+        token_w = image_size[0] // (self.patch_size * merge_size)
+
+        indexes_image_cond = self._build_t2i_image_indexes(
+            token_h, token_w, indexes_condition[0].max() + 1, device=self.device
+        )
+        indexes_image_img_cond = (
+            self._build_t2i_image_indexes(
+                token_h, token_w, indexes_img_cond[0].max() + 1, device=self.device
+            )
+            if indexes_img_cond is not None
+            else None
+        )
+        indexes_image_uncond = (
+            self._build_t2i_image_indexes(
+                token_h, token_w, indexes_uncond[0].max() + 1, device=self.device
+            )
+            if indexes_uncond is not None
+            else None
+        )
+
+        # Prefill KV caches
+        past_kv_cond, hidden_cond = self._it2i_prefix_forward(
+            input_embeds_condition, indexes_condition, attn_mask_condition
+        )
+        past_kv_img_cond = None
+        if input_embeds_img_cond is not None:
+            past_kv_img_cond, _ = self._it2i_prefix_forward(
+                input_embeds_img_cond, indexes_img_cond, attn_mask_img_cond
+            )
+        past_kv_uncond = None
+        if input_embeds_uncond is not None:
+            past_kv_uncond, _ = self._it2i_prefix_forward(
+                input_embeds_uncond, indexes_uncond, attn_mask_uncond
+            )
+
+        device = hidden_cond.device
+        dtype = hidden_cond.dtype
+
+        del pixel_values, grid_hw
+        del input_embeds_condition, indexes_condition, attn_mask_condition
+        if input_embeds_img_cond is not None:
+            del input_embeds_img_cond, indexes_img_cond, attn_mask_img_cond
+        if input_embeds_uncond is not None:
+            del input_embeds_uncond, indexes_uncond, attn_mask_uncond
+        del hidden_cond
+
+        # Expand prefix caches to batch_size
+        for li in range(len(past_kv_cond.layers)):
+            lc = past_kv_cond.layers[li]
+            lc.keys = lc.keys.expand(batch_size, *lc.keys.shape[1:])
+            lc.values = lc.values.expand(batch_size, *lc.values.shape[1:])
+            if past_kv_img_cond is not None:
+                lc2 = past_kv_img_cond.layers[li]
+                lc2.keys = lc2.keys.expand(batch_size, *lc2.keys.shape[1:])
+                lc2.values = lc2.values.expand(batch_size, *lc2.values.shape[1:])
+            if past_kv_uncond is not None:
+                lc3 = past_kv_uncond.layers[li]
+                lc3.keys = lc3.keys.expand(batch_size, *lc3.keys.shape[1:])
+                lc3.values = lc3.values.expand(batch_size, *lc3.values.shape[1:])
+
+        # Prepare flash KV caches
+        img_tokens = token_h * token_w
+        prepare_flash_kv_cache(past_kv_cond, current_len=img_tokens, batch_size=batch_size)
+        if past_kv_img_cond is not None:
+            prepare_flash_kv_cache(past_kv_img_cond, current_len=img_tokens, batch_size=batch_size)
+        if past_kv_uncond is not None:
+            prepare_flash_kv_cache(past_kv_uncond, current_len=img_tokens, batch_size=batch_size)
+
+        grid_h = image_size[1] // self.patch_size
+        grid_w = image_size[0] // self.patch_size
+        gen_grid_hw = torch.tensor([[grid_h, grid_w]] * batch_size, device=device)
+
+        noise_scale = self.noise_scale
+        if self.noise_scale_mode in ("resolution", "dynamic", "dynamic_sqrt"):
+            base = float(self.noise_scale_base_image_seq_len)
+            scale = math.sqrt((grid_h * grid_w) / (merge_size ** 2) / base)
+            noise_scale = scale * float(self.noise_scale)
+            if self.noise_scale_mode == "dynamic_sqrt":
+                noise_scale = math.sqrt(noise_scale)
+        noise_scale = min(noise_scale, self.noise_scale_max_value)
+        generator = torch.Generator(device).manual_seed(seed)
+        image_prediction = noise_scale * torch.randn(
+            (batch_size, 3, image_size[1], image_size[0]), device=device, dtype=dtype, generator=generator
+        )
+
+        timesteps = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+        if enable_timestep_shift:
+            timesteps = self._apply_time_schedule(timesteps, img_tokens, timestep_shift)
+
+        for step_i in range(num_steps):
+            t = timesteps[step_i]
+            t_next = timesteps[step_i + 1]
+            use_cfg = (t > cfg_interval[0] and t < cfg_interval[1]) or cfg_interval[0] == 0
+
+            z = self.patchify(image_prediction, self.patch_size * merge_size)
+            image_input = self.patchify(image_prediction, self.patch_size, channel_first=True)
+            image_embeds = self.extract_feature(
+                image_input.view(batch_size * grid_h * grid_w, -1), gen_model=True, grid_hw=gen_grid_hw
+            ).view(batch_size, img_tokens, -1)
+            t_expanded = t.expand(batch_size * img_tokens)
+            timestep_embeddings = self.fm_modules["timestep_embedder"](t_expanded).view(batch_size, img_tokens, -1)
+            if self.add_noise_scale_embedding:
+                ns_tensor = torch.full_like(t_expanded, noise_scale / self.noise_scale_max_value)
+                noise_emb = self.fm_modules["noise_scale_embedder"](ns_tensor).view(batch_size, img_tokens, -1)
+                timestep_embeddings = timestep_embeddings + noise_emb
+            image_embeds = image_embeds + timestep_embeddings
+
+            out_cond = self._t2i_predict_v(
+                image_embeds, indexes_image_cond, past_kv_cond, t, z, image_token_num=img_tokens, image_size=image_size
+            )
+
+            if not use_cfg:
+                v_pred = out_cond
+            elif cfg_scale == 1 and img_cfg_scale == 1:
+                v_pred = out_cond
+            elif img_cfg_scale == 1:
+                out_img_cond = self._t2i_predict_v(
+                    image_embeds, indexes_image_img_cond, past_kv_img_cond, t, z,
+                    image_token_num=img_tokens, image_size=image_size,
+                )
+                v_pred = out_img_cond + cfg_scale * (out_cond - out_img_cond)
+            elif cfg_scale == img_cfg_scale:
+                out_uncond = self._t2i_predict_v(
+                    image_embeds, indexes_image_uncond, past_kv_uncond, t, z,
+                    image_token_num=img_tokens, image_size=image_size,
+                )
+                v_pred = out_uncond + cfg_scale * (out_cond - out_uncond)
+            else:
+                out_img_cond = self._t2i_predict_v(
+                    image_embeds, indexes_image_img_cond, past_kv_img_cond, t, z,
+                    image_token_num=img_tokens, image_size=image_size,
+                )
+                out_uncond = self._t2i_predict_v(
+                    image_embeds, indexes_image_uncond, past_kv_uncond, t, z,
+                    image_token_num=img_tokens, image_size=image_size,
+                )
+                v_pred = (
+                    out_uncond
+                    + cfg_scale * (out_cond - out_img_cond)
+                    + img_cfg_scale * (out_img_cond - out_uncond)
+                )
+            if (cfg_scale > 1 or img_cfg_scale > 1) and use_cfg:
+                if cfg_norm == "global":
+                    norm_v_cond = torch.norm(out_cond, dim=(1, 2), keepdim=True)
+                    norm_v_cfg = torch.norm(v_pred, dim=(1, 2), keepdim=True)
+                    scale = (norm_v_cond / (norm_v_cfg + 1e-8)).clamp(min=0, max=1.0)
+                    v_pred = v_pred * scale
+                elif cfg_norm == "channel":
+                    norm_v_cond = torch.norm(out_cond, dim=-1, keepdim=True)
+                    norm_v_cfg = torch.norm(v_pred, dim=-1, keepdim=True)
+                    scale = (norm_v_cond / (norm_v_cfg + 1e-8)).clamp(min=0, max=1.0)
+                    v_pred = v_pred * scale
+
+            z = z + (t_next - t) * v_pred
+            image_prediction = self.unpatchify(z, self.patch_size * merge_size, image_size[1], image_size[0])
+
+        clear_flash_kv_cache(past_kv_cond)
+        if past_kv_img_cond is not None:
+            clear_flash_kv_cache(past_kv_img_cond)
+        if past_kv_uncond is not None:
+            clear_flash_kv_cache(past_kv_uncond)
+
+        return image_prediction

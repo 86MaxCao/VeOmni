@@ -1731,6 +1731,496 @@ class BagelForConditionalGeneration(PreTrainedModel):
         output_device = generated_sequence[0].device
         return torch.stack([i.to(output_device) for i in generated_sequence], dim=0)
 
+    # =========================================================================
+    # Image generation methods (VAE latent flow matching)
+    # =========================================================================
+
+    def prepare_vae_images(
+        self, curr_kvlens, curr_rope, images, transforms, new_token_ids, timestep=0
+    ):
+        patchified_vae_latent_shapes, packed_vae_position_ids = [], []
+        packed_vae_token_indexes = []
+        packed_text_ids, packed_text_indexes = [], []
+        packed_seqlens, packed_position_ids, packed_indexes = [], [], []
+        packed_key_value_indexes = []
+
+        _curr = curr = 0
+        vae_image_tensors = []
+        newlens, new_rope_out = [], []
+        for image, curr_kvlen, curr_position_id in zip(images, curr_kvlens, curr_rope):
+            packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
+            curr += curr_kvlen
+
+            packed_text_ids.append(new_token_ids["start_of_image"])
+            packed_text_indexes.append(_curr)
+            packed_indexes.append(curr)
+            curr += 1
+            _curr += 1
+
+            image_tensor = transforms(image)
+            vae_image_tensors.append(image_tensor)
+            vae_position_ids = self.get_flattened_position_ids(
+                image_tensor.size(1),
+                image_tensor.size(2),
+                self.latent_downsample,
+                max_num_patches_per_side=self.max_latent_size,
+            )
+            packed_vae_position_ids.append(vae_position_ids)
+            H, W = image_tensor.shape[1:]
+            h = H // self.latent_downsample
+            w = W // self.latent_downsample
+            patchified_vae_latent_shapes.append((h, w))
+
+            num_img_tokens = w * h
+            packed_vae_token_indexes.extend(range(_curr, _curr + num_img_tokens))
+            packed_indexes.extend(range(curr, curr + num_img_tokens))
+            curr += num_img_tokens
+            _curr += num_img_tokens
+
+            packed_text_ids.append(new_token_ids["end_of_image"])
+            packed_text_indexes.append(_curr)
+            packed_indexes.append(curr)
+            curr += 1
+            _curr += 1
+
+            packed_position_ids.extend([curr_position_id] * (num_img_tokens + 2))
+            packed_seqlens.append(num_img_tokens + 2)
+            newlens.append(curr_kvlen + num_img_tokens + 2)
+            new_rope_out.append(curr_position_id + 1)
+
+        image_sizes = [item.shape for item in vae_image_tensors]
+        max_image_size = [max(item) for item in list(zip(*image_sizes))]
+        padded_images = torch.zeros(size=(len(vae_image_tensors), *max_image_size))
+        for i, image_tensor in enumerate(vae_image_tensors):
+            padded_images[i, :, : image_tensor.shape[1], : image_tensor.shape[2]] = (
+                image_tensor
+            )
+
+        generation_input = {
+            "padded_images": padded_images,
+            "patchified_vae_latent_shapes": patchified_vae_latent_shapes,
+            "packed_vae_position_ids": torch.cat(packed_vae_position_ids, dim=0),
+            "packed_timesteps": torch.tensor([timestep]),
+            "packed_vae_token_indexes": torch.tensor(
+                packed_vae_token_indexes, dtype=torch.long
+            ),
+            "packed_text_ids": torch.tensor(packed_text_ids, dtype=torch.long),
+            "packed_text_indexes": torch.tensor(packed_text_indexes, dtype=torch.long),
+            "packed_position_ids": torch.tensor(packed_position_ids, dtype=torch.long),
+            "packed_seqlens": torch.tensor(packed_seqlens, dtype=torch.int),
+            "packed_indexes": torch.tensor(packed_indexes, dtype=torch.long),
+            "packed_key_value_indexes": torch.tensor(
+                packed_key_value_indexes, dtype=torch.long
+            ),
+            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
+        }
+
+        return generation_input, newlens, new_rope_out
+
+    @torch.no_grad()
+    def forward_cache_update_vae(
+        self,
+        vae_model,
+        past_key_values,
+        padded_images,
+        patchified_vae_latent_shapes,
+        packed_vae_position_ids,
+        packed_timesteps,
+        packed_vae_token_indexes,
+        packed_text_ids,
+        packed_text_indexes,
+        packed_position_ids,
+        packed_seqlens,
+        packed_indexes,
+        key_values_lens,
+        packed_key_value_indexes,
+    ):
+        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        packed_sequence = packed_text_embedding.new_zeros(
+            (sum(packed_seqlens), self.hidden_size)
+        )
+        packed_sequence[packed_text_indexes] = packed_text_embedding
+
+        padded_latent = vae_model.encode(padded_images)
+
+        p = self.latent_patch_size
+        packed_latent = []
+        for latent, (h, w) in zip(padded_latent, patchified_vae_latent_shapes):
+            latent = latent[:, : h * p, : w * p].reshape(
+                self.latent_channel, h, p, w, p
+            )
+            latent = torch.einsum("chpwq->hwpqc", latent).reshape(
+                -1, p * p * self.latent_channel
+            )
+            packed_latent.append(latent)
+        packed_latent = torch.cat(packed_latent, dim=0)
+        packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
+        packed_timestep_embeds = self.time_embedder(packed_timesteps)
+        packed_latent = (
+            self.vae2llm(packed_latent) + packed_timestep_embeds + packed_pos_embed
+        )
+        if packed_latent.dtype != packed_sequence.dtype:
+            packed_latent = packed_latent.to(packed_sequence.dtype)
+        packed_sequence[packed_vae_token_indexes] = packed_latent
+
+        extra_inputs = {}
+        if self.use_moe:
+            extra_inputs = {
+                "mode": "gen",
+                "packed_vae_token_indexes": packed_vae_token_indexes,
+                "packed_text_indexes": packed_text_indexes,
+            }
+
+        output = self.language_model.forward_inference(
+            packed_query_sequence=packed_sequence,
+            query_lens=packed_seqlens,
+            packed_query_position_ids=packed_position_ids,
+            packed_query_indexes=packed_indexes,
+            past_key_values=past_key_values,
+            key_values_lens=key_values_lens,
+            packed_key_value_indexes=packed_key_value_indexes,
+            update_past_key_values=True,
+            is_causal=False,
+            **extra_inputs,
+        )
+        return output.past_key_values
+
+    def prepare_vae_latent(self, curr_kvlens, curr_rope, image_sizes, new_token_ids):
+        packed_text_ids, packed_text_indexes = [], []
+        packed_vae_position_ids, packed_vae_token_indexes, packed_init_noises = (
+            [], [], [],
+        )
+        packed_position_ids, packed_seqlens, packed_indexes = [], [], []
+        packed_key_value_indexes = []
+
+        query_curr = curr = 0
+        for (H, W), curr_kvlen, curr_position_id in zip(
+            image_sizes, curr_kvlens, curr_rope
+        ):
+            packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
+            curr += curr_kvlen
+
+            packed_text_ids.append(new_token_ids["start_of_image"])
+            packed_text_indexes.append(query_curr)
+            packed_indexes.append(curr)
+            curr += 1
+            query_curr += 1
+
+            vae_position_ids = self.get_flattened_position_ids(
+                H, W,
+                self.latent_downsample,
+                max_num_patches_per_side=self.max_latent_size,
+            )
+            packed_vae_position_ids.append(vae_position_ids)
+
+            h, w = H // self.latent_downsample, W // self.latent_downsample
+            num_image_tokens = h * w
+            packed_init_noises.append(
+                torch.randn(
+                    num_image_tokens, self.latent_channel * self.latent_patch_size ** 2
+                )
+            )
+            packed_vae_token_indexes.extend(
+                range(query_curr, query_curr + num_image_tokens)
+            )
+            packed_indexes.extend(range(curr, curr + num_image_tokens))
+            curr += num_image_tokens
+            query_curr += num_image_tokens
+
+            packed_text_ids.append(new_token_ids["end_of_image"])
+            packed_text_indexes.append(query_curr)
+            packed_indexes.append(curr)
+            curr += 1
+            query_curr += 1
+
+            packed_position_ids.extend([curr_position_id] * (num_image_tokens + 2))
+            packed_seqlens.append(num_image_tokens + 2)
+
+        generation_input = {
+            "packed_text_ids": torch.tensor(packed_text_ids, dtype=torch.long),
+            "packed_text_indexes": torch.tensor(packed_text_indexes, dtype=torch.long),
+            "packed_init_noises": torch.cat(packed_init_noises, dim=0),
+            "packed_vae_position_ids": torch.cat(packed_vae_position_ids, dim=0),
+            "packed_vae_token_indexes": torch.tensor(
+                packed_vae_token_indexes, dtype=torch.long
+            ),
+            "packed_seqlens": torch.tensor(packed_seqlens, dtype=torch.int),
+            "packed_position_ids": torch.tensor(packed_position_ids, dtype=torch.long),
+            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
+            "packed_indexes": torch.tensor(packed_indexes, dtype=torch.long),
+            "packed_key_value_indexes": torch.tensor(
+                packed_key_value_indexes, dtype=torch.long
+            ),
+        }
+
+        return generation_input
+
+    def prepare_vae_latent_cfg(self, curr_kvlens, curr_rope, image_sizes):
+        packed_position_ids, packed_indexes, packed_key_value_indexes = (
+            [], [], [],
+        )
+
+        query_curr = curr = 0
+        for (H, W), curr_kvlen, curr_position_id in zip(
+            image_sizes, curr_kvlens, curr_rope
+        ):
+            packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
+            curr += curr_kvlen
+
+            packed_indexes.append(curr)
+            curr += 1
+            query_curr += 1
+
+            h, w = H // self.latent_downsample, W // self.latent_downsample
+            num_image_tokens = h * w
+            packed_indexes.extend(range(curr, curr + num_image_tokens))
+            curr += num_image_tokens
+            query_curr += num_image_tokens
+
+            packed_indexes.append(curr)
+            curr += 1
+            query_curr += 1
+
+            packed_position_ids.extend([curr_position_id] * (num_image_tokens + 2))
+
+        generation_input = {
+            "cfg_packed_position_ids": torch.tensor(
+                packed_position_ids, dtype=torch.long
+            ),
+            "cfg_key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
+            "cfg_packed_query_indexes": torch.tensor(packed_indexes, dtype=torch.long),
+            "cfg_packed_key_value_indexes": torch.tensor(
+                packed_key_value_indexes, dtype=torch.long
+            ),
+        }
+
+        return generation_input
+
+    @torch.no_grad()
+    def generate_image(
+        self,
+        packed_text_ids,
+        packed_text_indexes,
+        packed_init_noises,
+        packed_vae_position_ids,
+        packed_vae_token_indexes,
+        packed_seqlens,
+        packed_position_ids,
+        packed_indexes,
+        past_key_values,
+        key_values_lens,
+        packed_key_value_indexes,
+        num_timesteps=24,
+        timestep_shift=1.0,
+        cfg_renorm_min=0.0,
+        cfg_renorm_type="global",
+        cfg_interval=None,
+        # cfg_text
+        cfg_text_scale=1.0,
+        cfg_text_packed_query_indexes=None,
+        cfg_text_packed_position_ids=None,
+        cfg_text_past_key_values=None,
+        cfg_text_key_values_lens=None,
+        cfg_text_packed_key_value_indexes=None,
+        # cfg_img
+        cfg_img_scale=1.0,
+        cfg_img_packed_query_indexes=None,
+        cfg_img_packed_position_ids=None,
+        cfg_img_past_key_values=None,
+        cfg_img_key_values_lens=None,
+        cfg_img_packed_key_value_indexes=None,
+    ):
+        if cfg_interval is None:
+            cfg_interval = [0, 1]
+
+        x_t = packed_init_noises
+
+        timesteps = torch.linspace(1, 0, num_timesteps, device=x_t.device)
+        timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
+        dts = timesteps[:-1] - timesteps[1:]
+        timesteps = timesteps[:-1]
+
+        for i, t in enumerate(timesteps):
+            timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
+            if t > cfg_interval[0] and t <= cfg_interval[1]:
+                cfg_text_scale_ = cfg_text_scale
+                cfg_img_scale_ = cfg_img_scale
+            else:
+                cfg_text_scale_ = 1.0
+                cfg_img_scale_ = 1.0
+            v_t = self._forward_flow(
+                x_t=x_t,
+                timestep=timestep,
+                packed_vae_token_indexes=packed_vae_token_indexes,
+                packed_vae_position_ids=packed_vae_position_ids,
+                packed_text_ids=packed_text_ids,
+                packed_text_indexes=packed_text_indexes,
+                packed_position_ids=packed_position_ids,
+                packed_indexes=packed_indexes,
+                packed_seqlens=packed_seqlens,
+                key_values_lens=key_values_lens,
+                past_key_values=past_key_values,
+                packed_key_value_indexes=packed_key_value_indexes,
+                cfg_renorm_min=cfg_renorm_min,
+                cfg_renorm_type=cfg_renorm_type,
+                # cfg_text
+                cfg_text_scale=cfg_text_scale_,
+                cfg_text_packed_position_ids=cfg_text_packed_position_ids,
+                cfg_text_packed_query_indexes=cfg_text_packed_query_indexes,
+                cfg_text_key_values_lens=cfg_text_key_values_lens,
+                cfg_text_past_key_values=cfg_text_past_key_values,
+                cfg_text_packed_key_value_indexes=cfg_text_packed_key_value_indexes,
+                # cfg_img
+                cfg_img_scale=cfg_img_scale_,
+                cfg_img_packed_position_ids=cfg_img_packed_position_ids,
+                cfg_img_packed_query_indexes=cfg_img_packed_query_indexes,
+                cfg_img_key_values_lens=cfg_img_key_values_lens,
+                cfg_img_past_key_values=cfg_img_past_key_values,
+                cfg_img_packed_key_value_indexes=cfg_img_packed_key_value_indexes,
+            )
+
+            x_t = x_t - v_t.to(x_t.device) * dts[i]
+
+        unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
+        return unpacked_latent
+
+    @torch.no_grad()
+    def _forward_flow(
+        self,
+        x_t,
+        timestep,
+        packed_vae_token_indexes,
+        packed_vae_position_ids,
+        packed_text_ids,
+        packed_text_indexes,
+        packed_indexes,
+        packed_position_ids,
+        packed_seqlens,
+        key_values_lens,
+        past_key_values,
+        packed_key_value_indexes,
+        cfg_renorm_min=0.0,
+        cfg_renorm_type="global",
+        # cfg_text
+        cfg_text_scale=1.0,
+        cfg_text_packed_position_ids=None,
+        cfg_text_packed_query_indexes=None,
+        cfg_text_key_values_lens=None,
+        cfg_text_past_key_values=None,
+        cfg_text_packed_key_value_indexes=None,
+        # cfg_img
+        cfg_img_scale=1.0,
+        cfg_img_packed_position_ids=None,
+        cfg_img_packed_query_indexes=None,
+        cfg_img_key_values_lens=None,
+        cfg_img_past_key_values=None,
+        cfg_img_packed_key_value_indexes=None,
+    ):
+        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        packed_sequence = packed_text_embedding.new_zeros(
+            (sum(packed_seqlens), self.hidden_size)
+        )
+        packed_sequence[packed_text_indexes] = packed_text_embedding
+
+        assert timestep.unique().shape[0] == 1
+        packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
+        packed_timestep_embeds = self.time_embedder(timestep)
+        x_t = self.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed
+        if x_t.dtype != packed_sequence.dtype:
+            x_t = x_t.to(packed_sequence.dtype)
+        packed_sequence[packed_vae_token_indexes] = x_t
+
+        extra_inputs = {}
+        if self.use_moe:
+            extra_inputs = {
+                "mode": "gen",
+                "packed_vae_token_indexes": packed_vae_token_indexes,
+                "packed_text_indexes": packed_text_indexes,
+            }
+
+        output = self.language_model.forward_inference(
+            packed_query_sequence=packed_sequence,
+            query_lens=packed_seqlens,
+            packed_query_position_ids=packed_position_ids,
+            packed_query_indexes=packed_indexes,
+            past_key_values=past_key_values,
+            key_values_lens=key_values_lens,
+            packed_key_value_indexes=packed_key_value_indexes,
+            update_past_key_values=False,
+            is_causal=False,
+            **extra_inputs,
+        )
+        v_t = self.llm2vae(output.packed_query_sequence)
+        v_t = v_t[packed_vae_token_indexes]
+
+        if cfg_text_scale > 1.0:
+            cfg_text_output = self.language_model.forward_inference(
+                packed_query_sequence=packed_sequence,
+                query_lens=packed_seqlens,
+                packed_query_position_ids=cfg_text_packed_position_ids,
+                packed_query_indexes=cfg_text_packed_query_indexes,
+                past_key_values=cfg_text_past_key_values,
+                key_values_lens=cfg_text_key_values_lens,
+                packed_key_value_indexes=cfg_text_packed_key_value_indexes,
+                update_past_key_values=False,
+                is_causal=False,
+                **extra_inputs,
+            )
+            cfg_text_v_t = self.llm2vae(cfg_text_output.packed_query_sequence)
+            cfg_text_v_t = cfg_text_v_t[packed_vae_token_indexes]
+
+        if cfg_img_scale > 1.0:
+            cfg_img_output = self.language_model.forward_inference(
+                packed_query_sequence=packed_sequence,
+                query_lens=packed_seqlens,
+                packed_query_position_ids=cfg_img_packed_position_ids,
+                packed_query_indexes=cfg_img_packed_query_indexes,
+                past_key_values=cfg_img_past_key_values,
+                key_values_lens=cfg_img_key_values_lens,
+                packed_key_value_indexes=cfg_img_packed_key_value_indexes,
+                update_past_key_values=False,
+                is_causal=False,
+                **extra_inputs,
+            )
+            cfg_img_v_t = self.llm2vae(cfg_img_output.packed_query_sequence)
+            cfg_img_v_t = cfg_img_v_t[packed_vae_token_indexes]
+
+        if cfg_text_scale > 1.0:
+            if cfg_renorm_type == "text_channel":
+                v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
+                norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
+                norm_v_t_text_ = torch.norm(v_t_text_, dim=-1, keepdim=True)
+                scale = (norm_v_t / (norm_v_t_text_ + 1e-8)).clamp(
+                    min=cfg_renorm_min, max=1.0
+                )
+                v_t_text = v_t_text_ * scale
+                if cfg_img_scale > 1.0:
+                    v_t = cfg_img_v_t + cfg_img_scale * (v_t_text - cfg_img_v_t)
+                else:
+                    v_t = v_t_text
+            else:
+                v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
+
+                if cfg_img_scale > 1.0:
+                    v_t_ = cfg_img_v_t + cfg_img_scale * (v_t_text_ - cfg_img_v_t)
+                else:
+                    v_t_ = v_t_text_
+
+                if cfg_renorm_type == "global":
+                    norm_v_t = torch.norm(v_t)
+                    norm_v_t_ = torch.norm(v_t_)
+                elif cfg_renorm_type == "channel":
+                    norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
+                    norm_v_t_ = torch.norm(v_t_, dim=-1, keepdim=True)
+                else:
+                    raise NotImplementedError(f"{cfg_renorm_type} is not supported")
+                scale = (norm_v_t / (norm_v_t_ + 1e-8)).clamp(
+                    min=cfg_renorm_min, max=1.0
+                )
+                v_t = v_t_ * scale
+
+        return v_t
+
     @torch.no_grad()
     def chat(
         self,

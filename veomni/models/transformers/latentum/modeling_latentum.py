@@ -34,6 +34,62 @@ from .configuration_latentum import InternVisionConfig, LatentUMConfig
 
 
 # ==============================================================================
+# Sampling utilities for AR generation
+# ==============================================================================
+
+
+def _top_k_top_p_filtering(
+    logits: torch.Tensor,
+    top_k: int = 0,
+    top_p: float = 1.0,
+    filter_value: float = -float("Inf"),
+    min_tokens_to_keep: int = 1,
+) -> torch.Tensor:
+    """Filter logits using top-k and/or nucleus (top-p) filtering."""
+    if top_k > 0:
+        top_k = min(max(top_k, min_tokens_to_keep), logits.size(-1))
+        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+        logits[indices_to_remove] = filter_value
+    if top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+        sorted_indices_to_remove = cumulative_probs > top_p
+        if min_tokens_to_keep > 1:
+            sorted_indices_to_remove[..., :min_tokens_to_keep] = 0
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        logits[indices_to_remove] = filter_value
+    return logits
+
+
+def _sample_from_logits(
+    logits: torch.Tensor,
+    temperature: float = 1.0,
+    top_k: int = 0,
+    top_p: float = 1.0,
+    sample_logits: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample token indices from logits with temperature, top-k, and top-p.
+
+    Args:
+        logits: (B, V) logits
+    Returns:
+        idx: (B, 1) sampled indices
+        probs: (B, V) probabilities
+    """
+    logits = logits / max(temperature, 1e-5)
+    if top_k > 0 or top_p < 1.0:
+        logits = _top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
+    probs = F.softmax(logits, dim=-1)
+    if sample_logits:
+        idx = torch.multinomial(probs, num_samples=1)
+    else:
+        _, idx = torch.topk(probs, k=1, dim=-1)
+    return idx, probs
+
+
+# ==============================================================================
 # InternVision components
 # ==============================================================================
 
@@ -446,6 +502,47 @@ class AutoregressiveHead(nn.Module):
         x = self.norm(x)
         return self.head(x)
 
+    def generate_from_base_token(
+        self,
+        base_token: torch.Tensor,
+        cfg_scale: float,
+        sampling_kwargs: dict,
+    ) -> torch.Tensor:
+        """Generate K codebook indices from a single LLM hidden state.
+
+        Args:
+            base_token: (B, 1, D) if cfg_scale <= 1,
+                        (2*B, 1, D) if cfg_scale > 1 (first B=cond, last B=uncond)
+            cfg_scale: classifier-free guidance scale
+            sampling_kwargs: dict with temperature, top_k, top_p, sample_logits
+        Returns:
+            (B, K) generated codebook indices
+        """
+        generated_code = []
+        if cfg_scale > 1:
+            B = base_token.shape[0] // 2
+            curr_state_cond = base_token[:B]
+            curr_state_uncond = base_token[B:]
+            for i in range(self.num_codebooks):
+                logits_cond = self.forward(curr_state_cond)[:, -1, :]
+                logits_uncond = self.forward(curr_state_uncond)[:, -1, :]
+                logits = logits_uncond + cfg_scale * (logits_cond - logits_uncond)
+                next_token, _ = _sample_from_logits(logits, **sampling_kwargs)
+                generated_code.append(next_token)
+                next_embeddings = self.embeddings[i](next_token)
+                curr_state_cond = torch.cat([curr_state_cond, next_embeddings], dim=1)
+                curr_state_uncond = torch.cat([curr_state_uncond, next_embeddings], dim=1)
+            return torch.stack(generated_code, dim=1).squeeze(-1)
+        else:
+            curr_state = base_token
+            for i in range(self.num_codebooks):
+                logits = self.forward(curr_state)[:, -1, :]
+                next_token, _ = _sample_from_logits(logits, **sampling_kwargs)
+                generated_code.append(next_token)
+                next_embeddings = self.embeddings[i](next_token)
+                curr_state = torch.cat([curr_state, next_embeddings], dim=1)
+            return torch.stack(generated_code, dim=1).squeeze(-1)
+
 
 # ==============================================================================
 # Vector Quantizer
@@ -511,6 +608,22 @@ class MultiVectorQuantizer(nn.Module):
         indices = torch.stack(all_indices, dim=-1)
         return z_q, indices
 
+    def indices_to_feature(self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Look up codebook embeddings from indices.
+
+        Args:
+            indices: (..., num_codebooks) codebook indices
+        Returns:
+            z_q: (..., D) reconstructed quantized features
+            indices: unchanged
+        """
+        z_qs = []
+        for i, vq in enumerate(self.quantizers):
+            z_q_i = vq.codebook(indices[..., i])
+            z_qs.append(z_q_i)
+        z_q = torch.cat(z_qs, dim=-1)
+        return z_q, indices
+
 
 class VQ_MLP_MCQ(nn.Module):
     """
@@ -548,6 +661,17 @@ class VQ_MLP_MCQ(nn.Module):
         z = self.down_proj(vit_features)
         z_q, indices = self.quantizer.quantize(z)
         return z_q, indices
+
+    def indices_to_feature(self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map codebook indices back to continuous quantized features.
+
+        Args:
+            indices: (..., num_codebooks) codebook indices
+        Returns:
+            z_q: (..., embedding_dim) quantized features
+            indices: unchanged
+        """
+        return self.quantizer.indices_to_feature(indices)
 
 
 # ==============================================================================
@@ -911,3 +1035,341 @@ class LatentUMModel(PreTrainedModel):
                 loss = loss + ar_loss
 
         return SimpleNamespace(loss=loss, logits=logits, ar_loss=ar_loss)
+
+    # ==================================================================
+    # Inference: cached LLM forward + AR generation
+    # ==================================================================
+
+    def _get_rope_theta(self) -> float:
+        """Extract rope_theta from the LLM config, handling different config layouts."""
+        llm_cfg = self.config.internvl_config.llm_config
+        # Try the structured rope_parameters dict first (transformers v5+)
+        rp = getattr(llm_cfg, "rope_parameters", None)
+        if isinstance(rp, dict):
+            return float(rp.get("rope_theta", getattr(llm_cfg, "rope_theta", 1_000_000.0)))
+        # Fall back to direct attribute
+        return float(getattr(llm_cfg, "rope_theta", 1_000_000.0))
+
+    def _llm_forward_cached(
+        self,
+        inputs_embeds: torch.Tensor,
+        vision_token_mask: torch.Tensor | None = None,
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        attention_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        """Forward through LLM layers with MoT routing and KV cache.
+
+        Args:
+            inputs_embeds: [B, S_new, D]
+            vision_token_mask: [B, S_new] float (1.0=vision, 0.0=text)
+            past_key_values: list of (k_cache, v_cache) per layer, or None.
+                Each cache tensor has shape [B, num_kv_heads, S_past, head_dim].
+            attention_mask: [B, S_total] (1=attend, 0=pad). S_total = S_past + S_new.
+        Returns:
+            hidden_states: [B, S_new, D]
+            new_past_key_values: updated cache
+        """
+        device = inputs_embeds.device
+        B, S_new, D = inputs_embeds.shape
+        llm_cfg = self.config.internvl_config.llm_config
+        head_dim = llm_cfg.head_dim
+
+        past_seq_len = past_key_values[0][0].shape[2] if past_key_values else 0
+        S_total = past_seq_len + S_new
+
+        # RoPE for new positions only (cast to input dtype to avoid promotion)
+        rope_theta = self._get_rope_theta()
+        inv_freq = 1.0 / (rope_theta ** (
+            torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim
+        ))
+        positions = torch.arange(past_seq_len, S_total, device=device, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        rope_cos = emb.cos()[None, None, :, :].to(inputs_embeds.dtype)
+        rope_sin = emb.sin()[None, None, :, :].to(inputs_embeds.dtype)
+
+        has_mot = vision_token_mask is not None and vision_token_mask.any()
+
+        # Build attention mask (same dtype as inputs to avoid promotion)
+        input_dtype = inputs_embeds.dtype
+        attn_mask_4d: torch.Tensor | None = None
+        if S_new > 1:
+            causal = torch.triu(
+                torch.ones(S_new, S_total, device=device, dtype=torch.bool),
+                diagonal=past_seq_len + 1,
+            )
+            attn_mask_4d = torch.where(
+                causal,
+                torch.tensor(-65504.0, dtype=input_dtype, device=device),
+                torch.tensor(0.0, dtype=input_dtype, device=device),
+            )[None, None, :, :]
+        if attention_mask is not None:
+            pad_mask = ((1 - attention_mask[:, None, None, :].to(input_dtype)) * -65504.0)
+            attn_mask_4d = pad_mask if attn_mask_4d is None else attn_mask_4d + pad_mask
+
+        new_past_key_values: list[tuple[torch.Tensor, torch.Tensor]] = []
+        hidden_states = inputs_embeds
+
+        for layer_idx, layer in enumerate(self.internvl.language_model.model.layers):
+            residual = hidden_states
+            hidden_states_norm = layer.input_layernorm(hidden_states)
+            attn = layer.self_attn
+            _B, N, _D = hidden_states_norm.shape
+
+            # Q, K, V projection with optional MoT blending
+            if has_mot:
+                vmask = vision_token_mask[:, None, :, None]  # [B, 1, S_new, 1]
+                q_t = attn.q_proj(hidden_states_norm).view(_B, N, attn.num_heads, attn.head_dim).transpose(1, 2)
+                k_t = attn.k_proj(hidden_states_norm).view(_B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
+                v_t = attn.v_proj(hidden_states_norm).view(_B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
+                q_v = attn.q_proj_vision(hidden_states_norm).view(_B, N, attn.num_heads, attn.head_dim).transpose(1, 2)
+                k_v = attn.k_proj_vision(hidden_states_norm).view(_B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
+                v_v = attn.v_proj_vision(hidden_states_norm).view(_B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
+                q_t = attn.q_norm(q_t)
+                k_t = attn.k_norm(k_t)
+                q_v = attn.q_norm_vision(q_v)
+                k_v = attn.k_norm_vision(k_v)
+                q = vmask * q_v + (1 - vmask) * q_t
+                k_new = vmask * k_v + (1 - vmask) * k_t
+                v_new = vmask * v_v + (1 - vmask) * v_t
+            else:
+                q = attn.q_proj(hidden_states_norm).view(_B, N, attn.num_heads, attn.head_dim).transpose(1, 2)
+                k_new = attn.k_proj(hidden_states_norm).view(_B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
+                v_new = attn.v_proj(hidden_states_norm).view(_B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
+                q = attn.q_norm(q)
+                k_new = attn.k_norm(k_new)
+
+            # RoPE on new positions
+            q1, q2 = q[..., : head_dim // 2], q[..., head_dim // 2:]
+            q = q * rope_cos + torch.cat((-q2, q1), dim=-1) * rope_sin
+            k1, k2 = k_new[..., : head_dim // 2], k_new[..., head_dim // 2:]
+            k_new = k_new * rope_cos + torch.cat((-k2, k1), dim=-1) * rope_sin
+
+            # Concatenate with cached KV
+            if past_key_values is not None:
+                k_past, v_past = past_key_values[layer_idx]
+                k_full = torch.cat([k_past, k_new], dim=2)
+                v_full = torch.cat([v_past, v_new], dim=2)
+            else:
+                k_full = k_new
+                v_full = v_new
+            new_past_key_values.append((k_full, v_full))
+
+            # GQA expansion
+            if attn.num_kv_heads < attn.num_heads:
+                rep = attn.num_heads // attn.num_kv_heads
+                k_exp = k_full.repeat_interleave(rep, dim=1)
+                v_exp = v_full.repeat_interleave(rep, dim=1)
+            else:
+                k_exp = k_full
+                v_exp = v_full
+
+            # Attention
+            if attn_mask_4d is not None:
+                attn_out = F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=attn_mask_4d)
+            elif S_new > 1 and past_seq_len == 0:
+                attn_out = F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=True)
+            else:
+                attn_out = F.scaled_dot_product_attention(q, k_exp, v_exp)
+            attn_out = attn_out.transpose(1, 2).reshape(_B, N, -1)
+
+            # Output projection with MoT
+            if has_mot:
+                o_t = attn.o_proj(attn_out)
+                o_v = attn.o_proj_vision(attn_out)
+                vmask_s = vision_token_mask[:, :, None]
+                hidden_states = residual + vmask_s * o_v + (1 - vmask_s) * o_t
+            else:
+                hidden_states = residual + attn.o_proj(attn_out)
+
+            # MLP with MoT
+            residual = hidden_states
+            post_norm = layer.post_attention_layernorm(hidden_states)
+            if has_mot:
+                mlp_t = layer.mlp(post_norm)
+                mlp_v = layer.mlp_vision(post_norm)
+                vmask_s = vision_token_mask[:, :, None]
+                hidden_states = residual + vmask_s * mlp_v + (1 - vmask_s) * mlp_t
+            else:
+                hidden_states = residual + layer.mlp(post_norm)
+
+        hidden_states = self.internvl.language_model.model.norm(hidden_states)
+        return hidden_states, new_past_key_values
+
+    @torch.inference_mode()
+    def generate_latents(
+        self,
+        tokenizer,
+        prompts: str | list[str],
+        *,
+        num_images_per_prompt: int = 1,
+        cfg_scale: float = 3.0,
+        temperature: float = 0.9,
+        top_k: int = 50,
+        top_p: float = 0.95,
+        seed: int | None = None,
+        sample_logits: bool = True,
+        verbose: bool = False,
+    ) -> torch.Tensor:
+        """Generate 256-position discrete latent codes from text prompts.
+
+        Args:
+            tokenizer: HF tokenizer for the model.
+            prompts: single string or list of prompt strings.
+            num_images_per_prompt: number of images to generate per prompt.
+            cfg_scale: classifier-free guidance scale (>1 enables CFG).
+            temperature, top_k, top_p: sampling parameters.
+            seed: random seed for reproducibility.
+            sample_logits: if False, use argmax instead of sampling.
+            verbose: show progress bar.
+        Returns:
+            (B, 256, K) tensor of codebook indices.
+        """
+        from tqdm import trange
+
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+        img_start_token = "<img>"
+
+        if seed is not None:
+            torch.manual_seed(seed)
+
+        sampling_kwargs = {
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
+            "sample_logits": sample_logits,
+        }
+
+        # Prepare prompts
+        if isinstance(prompts, str):
+            batch_prompts = [prompts + img_start_token] * num_images_per_prompt
+        else:
+            batch_prompts = [p + img_start_token for p in prompts for _ in range(num_images_per_prompt)]
+
+        tokenizer_output = tokenizer(
+            batch_prompts,
+            padding=True,
+            padding_side="left",
+            truncation=True,
+            return_tensors="pt",
+        )
+        input_ids = tokenizer_output["input_ids"].to(device)
+        attention_mask = tokenizer_output["attention_mask"].to(device)
+        text_embedding = self.get_input_embeddings()(input_ids)
+
+        # CFG: build unconditional embeddings
+        if cfg_scale > 1:
+            uncond_input_ids = input_ids.clone()
+            pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+            img_token_id = tokenizer.convert_tokens_to_ids(img_start_token)
+            for b in range(uncond_input_ids.shape[0]):
+                for t in range(uncond_input_ids.shape[1]):
+                    if uncond_input_ids[b, t] == img_token_id:
+                        break
+                    uncond_input_ids[b, t] = pad_token_id
+            uncond_text_embedding = self.get_input_embeddings()(uncond_input_ids)
+            text_embedding_cfg = torch.cat([text_embedding, uncond_text_embedding], dim=0)
+            attention_mask_cfg = torch.cat([attention_mask, attention_mask.clone()], dim=0)
+        else:
+            text_embedding_cfg = text_embedding
+            attention_mask_cfg = attention_mask
+
+        # 256-step AR generation loop
+        past_key_values = None
+        generated_codes: list[torch.Tensor] = []
+        accumulated_attention_mask = attention_mask_cfg.clone()
+        iterator = trange(256, desc="Generating latents") if verbose else range(256)
+
+        for i in iterator:
+            if i == 0:
+                current_input = text_embedding_cfg
+                current_attention_mask = accumulated_attention_mask
+                vision_token_mask = torch.zeros(
+                    current_input.shape[0], current_input.shape[1],
+                    device=device, dtype=dtype,
+                )
+                vision_token_mask[:, -1] = 1.0  # <img> start token is vision
+            else:
+                if cfg_scale > 1:
+                    current_input = torch.cat([img_embeds_current, img_embeds_current], dim=0)
+                else:
+                    current_input = img_embeds_current  # noqa: F821
+                accumulated_attention_mask = torch.cat([
+                    accumulated_attention_mask,
+                    torch.ones(
+                        accumulated_attention_mask.shape[0], 1,
+                        device=device, dtype=accumulated_attention_mask.dtype,
+                    ),
+                ], dim=1)
+                current_attention_mask = accumulated_attention_mask
+                vision_token_mask = torch.ones(
+                    current_input.shape[0], current_input.shape[1],
+                    device=device, dtype=dtype,
+                )
+
+            hidden_states, past_key_values = self._llm_forward_cached(
+                current_input,
+                vision_token_mask=vision_token_mask,
+                past_key_values=past_key_values,
+                attention_mask=current_attention_mask,
+            )
+            base_token = hidden_states[:, -1:, :]
+
+            generated_code = self.internvl.ar_head.generate_from_base_token(
+                base_token, cfg_scale, sampling_kwargs,
+            )
+            z_q_current, _ = self.quantizer.indices_to_feature(generated_code.unsqueeze(1))
+            img_embeds_current = self.internvl.visual_projector(z_q_current)
+            generated_codes.append(generated_code)
+
+        # generated_code from AR head is (B, K) when no CFG, or (B_half, K) with CFG
+        # Stack along position dim
+        return torch.stack(generated_codes, dim=1)  # (B, 256, K)
+
+    @torch.inference_mode()
+    def generate_images(
+        self,
+        tokenizer,
+        prompts: str | list[str],
+        *,
+        decoder=None,
+        num_images_per_prompt: int = 1,
+        cfg_scale: float = 3.0,
+        temperature: float = 0.9,
+        top_k: int = 50,
+        top_p: float = 0.95,
+        seed: int | None = None,
+        num_inference_steps: int = 25,
+        guidance_scale: float = 1.0,
+        show_progress: bool = False,
+    ):
+        """Generate images from text prompts (latent generation + decoder).
+
+        Args:
+            tokenizer: HF tokenizer.
+            prompts: text prompts.
+            decoder: LatentUMDecoderModel for decoding latents to pixels.
+            Other args: see generate_latents and decoder.decode.
+        Returns:
+            list of PIL Images.
+        """
+        if decoder is None:
+            raise ValueError("A decoder is required for generate_images().")
+        latents = self.generate_latents(
+            tokenizer, prompts,
+            num_images_per_prompt=num_images_per_prompt,
+            cfg_scale=cfg_scale, temperature=temperature,
+            top_k=top_k, top_p=top_p, seed=seed,
+            verbose=show_progress,
+        )
+        device = next(self.parameters()).device
+        z_q, _ = self.quantizer.indices_to_feature(latents.to(device))
+        image_size = self.config.image_size
+        return decoder.decode(
+            z_q, seed=seed,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            height=image_size, width=image_size,
+            show_progress=show_progress,
+        )
