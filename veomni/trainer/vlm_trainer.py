@@ -179,8 +179,9 @@ class VLMTrainer:
         args: VeOmniVLMArguments = self.base.args
         self.base.processor = build_processor(args.model.tokenizer_path, max_pixels=MAX_PIXELS)
         if self.base.model_config.model_type not in ("qwen2_5_omni", "qwen3_omni_moe"):
+            tokenizer = getattr(self.base.processor, "tokenizer", self.base.processor)
             self.base.chat_template = build_multimodal_chat_template(
-                args.data.chat_template, self.base.processor.tokenizer
+                args.data.chat_template, tokenizer
             )
             self.base.model_assets = [self.base.processor, self.base.chat_template]
         else:
@@ -191,11 +192,13 @@ class VLMTrainer:
         args: VeOmniVLMArguments = self.base.args
         model_type = self.base.model_config.model_type
 
+        get_pos_id = getattr(self.base.model, "get_position_id_func", None)
+        position_id_func = get_pos_id() if get_pos_id is not None else None
         self.base.data_transform = build_data_transform(
             model_type,
             processor=self.base.processor,
             chat_template=self.base.chat_template,
-            position_id_func=self.base.model.get_position_id_func(),
+            position_id_func=position_id_func,
             **args.data.mm_configs,
         )
 

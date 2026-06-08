@@ -108,13 +108,26 @@ FqnToIndexMappingConverter = Callable[[Dict[str, int]], Dict[str, int]]
 
 def shard_index_from_filename(filename: str) -> int:
     """Parse shard index from ``model-00003-of-00014.safetensors`` style names."""
-    return int(filename.split("-")[1])
+    parts = filename.split("-")
+    if len(parts) >= 2:
+        try:
+            return int(parts[1])
+        except ValueError:
+            pass
+    return -1
 
 
 def parse_fqn_to_index_mapping_from_json(safetensor_idx_path: str) -> Dict[str, int]:
     """Load ``weight_map`` from a HuggingFace ``model.safetensors.index.json`` file."""
     with open(safetensor_idx_path) as f:
         weight_map = json.load(f)["weight_map"]
+
+    unique_files = sorted(set(weight_map.values()))
+    first = unique_files[0] if unique_files else ""
+    if "-" not in first or shard_index_from_filename(first) < 0:
+        file_to_idx = {fn: i for i, fn in enumerate(unique_files)}
+        return {fqn: file_to_idx[filename] for fqn, filename in weight_map.items()}
+
     return {fqn: shard_index_from_filename(filename) for fqn, filename in weight_map.items()}
 
 

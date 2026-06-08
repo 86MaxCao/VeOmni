@@ -16,7 +16,6 @@ from ...loader import (
     MODEL_CONFIG_REGISTRY,
     MODEL_PROCESSOR_REGISTRY,
     MODELING_REGISTRY,
-    raise_unsupported_veomni_modeling,
 )
 
 
@@ -27,10 +26,22 @@ def register_janus_config():
     return JanusConfig
 
 
+@MODEL_CONFIG_REGISTRY.register("multi_modality")
+def register_janus_config_alias():
+    from .configuration_janus import JanusConfig
+
+    return JanusConfig
+
+
 @MODELING_REGISTRY.register("janus")
 def register_janus_modeling(architecture: str):
-    raise_unsupported_veomni_modeling("janus")
+    from .modeling_janus import Janus
 
+    return Janus
+
+
+@MODELING_REGISTRY.register("multi_modality")
+def register_janus_modeling_alias(architecture: str):
     from .modeling_janus import Janus
 
     return Janus

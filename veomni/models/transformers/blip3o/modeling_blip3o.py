@@ -778,6 +778,7 @@ class BLIP3oQwenForCausalLM(PreTrainedModel):
     def _llm_forward(self, inputs_embeds):
         """Run LLM backbone forward with causal attention and RoPE."""
         device = inputs_embeds.device
+        param_dtype = inputs_embeds.dtype
         seq_len = inputs_embeds.shape[1]
 
         head_dim = self.config.hidden_size // self.config.num_attention_heads
@@ -787,8 +788,8 @@ class BLIP3oQwenForCausalLM(PreTrainedModel):
         positions = torch.arange(seq_len, device=device, dtype=torch.float32)
         freqs = torch.outer(positions, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        rope_cos = emb.cos()[None, None, :, :]
-        rope_sin = emb.sin()[None, None, :, :]
+        rope_cos = emb.cos()[None, None, :, :].to(param_dtype)
+        rope_sin = emb.sin()[None, None, :, :].to(param_dtype)
 
         hidden_states = inputs_embeds
         for layer in self.model.layers:
@@ -799,8 +800,8 @@ class BLIP3oQwenForCausalLM(PreTrainedModel):
             q = attn.q_proj(hidden_states_norm).view(B, N, attn.num_heads, attn.head_dim).transpose(1, 2)
             k = attn.k_proj(hidden_states_norm).view(B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
             v = attn.v_proj(hidden_states_norm).view(B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
-            q = attn.q_norm(q)
-            k = attn.k_norm(k)
+            q = attn.q_norm(q).to(param_dtype)
+            k = attn.k_norm(k).to(param_dtype)
             q1, q2 = q[..., : head_dim // 2], q[..., head_dim // 2 :]
             q = q * rope_cos + torch.cat((-q2, q1), dim=-1) * rope_sin
             k1, k2 = k[..., : head_dim // 2], k[..., head_dim // 2 :]

@@ -15,6 +15,7 @@
 
 import io
 import math
+import os
 from io import BytesIO
 from typing import ByteString, List, Union
 
@@ -109,6 +110,9 @@ def load_image(image: ImageInput, **kwargs):
 
 
 def fetch_images(images: List[ImageInput], **kwargs):
+    image_root = kwargs.get("image_root", None)
+    if image_root:
+        images = [os.path.join(image_root, img) if isinstance(img, str) and not os.path.isabs(img) else img for img in images]
     images = [load_image(image) for image in images]
     max_image_nums = kwargs.get("max_image_nums", len(images))
     images = images[:max_image_nums]

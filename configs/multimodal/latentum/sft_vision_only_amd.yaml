@@ -1,0 +1,57 @@
+model:
+  model_path: __MODEL_PATH__
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    rotary_pos_emb_implementation: eager
+    cross_entropy_loss_implementation: eager
+    load_balancing_loss_implementation: eager
+    moe_implementation: eager
+
+data:
+  train_path: __TRAIN_DATA_PATH__
+  data_type: conversation
+  chat_template: qwen3vl
+  datasets_type: iterable
+  source_name: qwen_omni_offline_av
+  silent_exception: true
+  max_seq_len: 4096
+  train_size: 80000000
+  mm_configs:
+    image_root: __IMAGE_ROOT__
+    image_max_pixels: 602112
+
+train:
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: false
+  gradient_checkpointing:
+    enable: true
+    enable_reentrant: false
+  wandb:
+    enable: true
+    project: unified_sft
+    name: latentum_vision_only_amd
+  # --- LatentUM 阶段 2: vision_only ---
+  # 训练 MoT 视觉路径 (*_vision 参数) + ar_head
+  # 冻结整个 internvl + quantizer，解冻 LLM 中含 _vision 参数 + ar_head
+  # MMDiT: 冻结主体，解冻 context_embedder + context_block
+  training_stage: vision_only
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  num_train_epochs: 3
+  micro_batch_size: 1
+  global_batch_size: 16
+  init_device: meta
+  checkpoint:
+    output_dir: __OUTPUT_DIR__
+    manager: dcp
+    save_hf_weights: true
+    save_steps: 200

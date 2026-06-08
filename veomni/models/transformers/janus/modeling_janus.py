@@ -1182,7 +1182,7 @@ class vision_head(torch.nn.Module):
 
 class Janus(PreTrainedModel):
     config_class = JanusConfig
-    _no_split_modules = []
+    _no_split_modules = ["LlamaDecoderLayer"]
     supports_gradient_checkpointing = True
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn_2 = True

@@ -1,0 +1,54 @@
+model:
+  model_path: __MODEL_PATH__
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    rotary_pos_emb_implementation: eager
+    cross_entropy_loss_implementation: eager
+
+data:
+  train_path: __TRAIN_DATA_PATH__
+  data_type: conversation
+  chat_template: janus
+  datasets_type: iterable
+  source_name: qwen_omni_offline_av
+  silent_exception: true
+  max_seq_len: 4096
+  train_size: 80000000
+  mm_configs:
+    image_root: __IMAGE_ROOT__
+    image_max_pixels: 602112
+
+train:
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: false
+  gradient_checkpointing:
+    enable: true
+    enable_reentrant: false
+  wandb:
+    enable: true
+    project: unified_sft
+    name: janus_sft_amd
+  freeze_vit: true
+  freeze_vae: true
+  mse_weight: 1.0
+  ce_weight: 1.0
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  num_train_epochs: 3
+  micro_batch_size: 1
+  global_batch_size: 16
+  init_device: meta
+  checkpoint:
+    output_dir: __OUTPUT_DIR__
+    manager: dcp
+    save_hf_weights: true
+    save_steps: 200

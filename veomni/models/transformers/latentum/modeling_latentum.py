@@ -247,7 +247,7 @@ class InternVisionModel(nn.Module):
 
 
 class Qwen3MoTRMSNorm(nn.Module):
-    """RMSNorm matching Qwen3's implementation."""
+    """RMSNorm matching Qwen3's implementation (official LatentUM pattern)."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -281,6 +281,7 @@ class Qwen3MoTAttention(nn.Module):
 
     Contains standard text projections (q_proj, k_proj, v_proj, o_proj, q_norm, k_norm)
     plus vision-specific duplicates (*_vision) for the MoT vision path.
+    Ref: LatentUM/model/latentum/internvl/mot.py — create_mot_attention_forward
     """
 
     def __init__(self, hidden_size: int, num_heads: int, num_kv_heads: int, head_dim: int, rms_norm_eps: float):
@@ -306,6 +307,64 @@ class Qwen3MoTAttention(nn.Module):
         self.q_norm_vision = Qwen3MoTRMSNorm(head_dim, eps=rms_norm_eps)
         self.k_norm_vision = Qwen3MoTRMSNorm(head_dim, eps=rms_norm_eps)
 
+    def forward(self, hidden_states, rope_cos, rope_sin, vision_token_mask=None, attention_mask_4d=None):
+        """Forward with MoT routing.
+
+        Ref: LatentUM/model/latentum/internvl/mot.py — create_mot_attention_forward
+        """
+        B, N, D = hidden_states.shape
+        has_mot = vision_token_mask is not None and vision_token_mask.any()
+
+        if has_mot:
+            vmask = vision_token_mask[:, None, :, None]  # [B, 1, S, 1]
+            q_t = self.q_proj(hidden_states).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+            k_t = self.k_proj(hidden_states).view(B, N, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v_t = self.v_proj(hidden_states).view(B, N, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            q_v = self.q_proj_vision(hidden_states).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+            k_v = self.k_proj_vision(hidden_states).view(B, N, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v_v = self.v_proj_vision(hidden_states).view(B, N, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            q_t = self.q_norm(q_t)
+            k_t = self.k_norm(k_t)
+            q_v = self.q_norm_vision(q_v)
+            k_v = self.k_norm_vision(k_v)
+            q = vmask * q_v + (1 - vmask) * q_t
+            k = vmask * k_v + (1 - vmask) * k_t
+            v = vmask * v_v + (1 - vmask) * v_t
+        else:
+            q = self.q_proj(hidden_states).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+            k = self.k_proj(hidden_states).view(B, N, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v = self.v_proj(hidden_states).view(B, N, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+        head_dim = self.head_dim
+        orig_q_dtype = q.dtype
+        q1, q2 = q[..., : head_dim // 2], q[..., head_dim // 2:]
+        q = q * rope_cos + torch.cat((-q2, q1), dim=-1) * rope_sin
+        q = q.to(orig_q_dtype)
+        k1, k2 = k[..., : head_dim // 2], k[..., head_dim // 2:]
+        k = k * rope_cos + torch.cat((-k2, k1), dim=-1) * rope_sin
+        k = k.to(orig_q_dtype)
+
+        if self.num_kv_heads < self.num_heads:
+            rep = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(rep, dim=1)
+            v = v.repeat_interleave(rep, dim=1)
+
+        if attention_mask_4d is not None:
+            attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask_4d)
+        else:
+            attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        attn_out = attn_out.transpose(1, 2).reshape(B, N, -1)
+
+        if has_mot:
+            vmask_s = vision_token_mask[:, :, None]  # [B, S, 1]
+            o_t = self.o_proj(attn_out)
+            o_v = self.o_proj_vision(attn_out)
+            return vmask_s * o_v + (1 - vmask_s) * o_t
+        else:
+            return self.o_proj(attn_out)
+
 
 class Qwen3MoTDecoderLayer(nn.Module):
     """
@@ -313,6 +372,7 @@ class Qwen3MoTDecoderLayer(nn.Module):
 
     Contains standard components (input_layernorm, self_attn, post_attention_layernorm, mlp)
     plus a vision-specific mlp_vision for the MoT path.
+    Ref: LatentUM/model/latentum/internvl/mot.py — create_mot_decoder_forward
     """
 
     def __init__(self, hidden_size: int, intermediate_size: int, num_heads: int, num_kv_heads: int, head_dim: int, rms_norm_eps: float):
@@ -322,6 +382,29 @@ class Qwen3MoTDecoderLayer(nn.Module):
         self.post_attention_layernorm = Qwen3MoTRMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = Qwen3MoTMLP(hidden_size, intermediate_size)
         self.mlp_vision = Qwen3MoTMLP(hidden_size, intermediate_size)
+
+    def forward(self, hidden_states, rope_cos, rope_sin, vision_token_mask=None, attention_mask_4d=None):
+        """Forward with MoT routing.
+
+        Ref: LatentUM/model/latentum/internvl/mot.py — create_mot_decoder_forward
+        """
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(hidden_states, rope_cos, rope_sin, vision_token_mask, attention_mask_4d)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        has_mot = vision_token_mask is not None and vision_token_mask.any()
+        if has_mot:
+            vmask_s = vision_token_mask[:, :, None]
+            mlp_t = self.mlp(hidden_states)
+            mlp_v = self.mlp_vision(hidden_states)
+            hidden_states = vmask_s * mlp_v + (1 - vmask_s) * mlp_t
+        else:
+            hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
 
 
 class Qwen3MoTModel(nn.Module):
@@ -843,71 +926,9 @@ class LatentUMModel(PreTrainedModel):
         rope_cos = emb.cos()[None, None, :, :]
         rope_sin = emb.sin()[None, None, :, :]
 
-        has_mot = vision_token_mask is not None and vision_token_mask.any()
-        if has_mot:
-            vmask = vision_token_mask[:, None, :, None]  # [B, 1, S, 1]
-
         hidden_states = inputs_embeds
         for layer in self.internvl.language_model.model.layers:
-            residual = hidden_states
-            hidden_states_norm = layer.input_layernorm(hidden_states)
-            attn = layer.self_attn
-            _B, N, _D = hidden_states_norm.shape
-
-            if has_mot:
-                q_t = attn.q_proj(hidden_states_norm).view(_B, N, attn.num_heads, attn.head_dim).transpose(1, 2)
-                k_t = attn.k_proj(hidden_states_norm).view(_B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
-                v_t = attn.v_proj(hidden_states_norm).view(_B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
-                q_v = attn.q_proj_vision(hidden_states_norm).view(_B, N, attn.num_heads, attn.head_dim).transpose(1, 2)
-                k_v = attn.k_proj_vision(hidden_states_norm).view(_B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
-                v_v = attn.v_proj_vision(hidden_states_norm).view(_B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
-                q_t = attn.q_norm(q_t)
-                k_t = attn.k_norm(k_t)
-                q_v = attn.q_norm_vision(q_v)
-                k_v = attn.k_norm_vision(k_v)
-                q = vmask * q_v + (1 - vmask) * q_t
-                k = vmask * k_v + (1 - vmask) * k_t
-                v = vmask * v_v + (1 - vmask) * v_t
-            else:
-                q = attn.q_proj(hidden_states_norm).view(_B, N, attn.num_heads, attn.head_dim).transpose(1, 2)
-                k = attn.k_proj(hidden_states_norm).view(_B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
-                v = attn.v_proj(hidden_states_norm).view(_B, N, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
-                q = attn.q_norm(q)
-                k = attn.k_norm(k)
-
-            q1, q2 = q[..., : head_dim // 2], q[..., head_dim // 2:]
-            q = q * rope_cos + torch.cat((-q2, q1), dim=-1) * rope_sin
-            k1, k2 = k[..., : head_dim // 2], k[..., head_dim // 2:]
-            k = k * rope_cos + torch.cat((-k2, k1), dim=-1) * rope_sin
-
-            if attn.num_kv_heads < attn.num_heads:
-                rep = attn.num_heads // attn.num_kv_heads
-                k = k.repeat_interleave(rep, dim=1)
-                v = v.repeat_interleave(rep, dim=1)
-
-            if attention_mask_4d is not None:
-                attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask_4d)
-            else:
-                attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            attn_out = attn_out.transpose(1, 2).reshape(_B, N, -1)
-
-            if has_mot:
-                o_t = attn.o_proj(attn_out)
-                o_v = attn.o_proj_vision(attn_out)
-                vmask_s = vision_token_mask[:, :, None]  # [B, S, 1]
-                hidden_states = residual + vmask_s * o_v + (1 - vmask_s) * o_t
-            else:
-                hidden_states = residual + attn.o_proj(attn_out)
-
-            residual = hidden_states
-            post_norm = layer.post_attention_layernorm(hidden_states)
-            if has_mot:
-                mlp_t = layer.mlp(post_norm)
-                mlp_v = layer.mlp_vision(post_norm)
-                vmask_s = vision_token_mask[:, :, None]
-                hidden_states = residual + vmask_s * mlp_v + (1 - vmask_s) * mlp_t
-            else:
-                hidden_states = residual + layer.mlp(post_norm)
+            hidden_states = layer(hidden_states, rope_cos, rope_sin, vision_token_mask, attention_mask_4d)
 
         hidden_states = self.internvl.language_model.model.norm(hidden_states)
         return hidden_states

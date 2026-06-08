@@ -107,6 +107,18 @@ class JanusGenVisionConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 
+_SIGLIP_MODEL_CONFIGS = {
+    "siglip_so400m_patch14_384": {
+        "image_size": 384, "patch_size": 14, "width": 1152, "layers": 27,
+        "heads": 16, "mlp_ratio": 3.7362, "global_pool": "map",
+    },
+    "siglip_large_patch16_384": {
+        "image_size": 384, "patch_size": 16, "width": 1024, "layers": 24,
+        "heads": 16, "mlp_ratio": 4, "global_pool": "map",
+    },
+}
+
+
 class JanusConfig(PretrainedConfig):
     model_type = "janus"
 
@@ -122,11 +134,18 @@ class JanusConfig(PretrainedConfig):
         gen_head_embed=2048,
         **kwargs,
     ):
+        # Also accept official Janus config keys (aligner_config, gen_aligner_config, gen_head_config)
+        aligner_config = kwargs.pop("aligner_config", None)
+        gen_aligner_config = kwargs.pop("gen_aligner_config", None)
+        gen_head_config = kwargs.pop("gen_head_config", None)
+
+        vision_config = self._parse_vision_config(vision_config)
         if vision_config is None:
             self.vision_config = JanusVisionConfig()
         else:
             self.vision_config = JanusVisionConfig(**vision_config)
 
+        gen_vision_config = self._parse_gen_vision_config(gen_vision_config)
         if gen_vision_config is None:
             self.gen_vision_config = JanusGenVisionConfig()
         else:
@@ -138,6 +157,21 @@ class JanusConfig(PretrainedConfig):
             self.language_config = LlamaConfig(**language_config)
 
         self.n_embed = self.language_config.hidden_size
+
+        if aligner_config and "params" in aligner_config:
+            params = aligner_config["params"]
+            aligner_depth = params.get("depth", aligner_depth)
+            aligner_projector_type = params.get("projector_type", aligner_projector_type)
+
+        if gen_aligner_config and "params" in gen_aligner_config:
+            params = gen_aligner_config["params"]
+            gen_aligner_depth = params.get("depth", gen_aligner_depth)
+            gen_aligner_projector_type = params.get("projector_type", gen_aligner_projector_type)
+
+        if gen_head_config and "params" in gen_head_config:
+            params = gen_head_config["params"]
+            gen_head_embed = params.get("image_token_embed", gen_head_embed)
+
         self.aligner_input_dim = self.vision_config.width
         self.gen_aligner_input_dim = self.gen_vision_config.codebook_embed_dim
         self.image_token_size = self.gen_vision_config.codebook_size
@@ -149,3 +183,33 @@ class JanusConfig(PretrainedConfig):
 
         self.gen_head_embed = gen_head_embed
         super().__init__(**kwargs)
+
+    @staticmethod
+    def _parse_vision_config(vision_config):
+        """Handle official Janus {cls, params} format for vision config."""
+        if vision_config is None:
+            return None
+        if "params" not in vision_config:
+            return vision_config
+        params = vision_config["params"]
+        model_name = params.get("model_name", "")
+        if model_name in _SIGLIP_MODEL_CONFIGS:
+            cfg = dict(_SIGLIP_MODEL_CONFIGS[model_name])
+            cfg["select_feature"] = params.get("select_feature", "patch")
+            cfg["select_layer"] = params.get("select_layer", -2)
+            cfg["image_size"] = params.get("image_size", cfg["image_size"])
+            return cfg
+        return vision_config
+
+    @staticmethod
+    def _parse_gen_vision_config(gen_vision_config):
+        """Handle official Janus {cls, params} format for gen vision config."""
+        if gen_vision_config is None:
+            return None
+        if "params" not in gen_vision_config:
+            return gen_vision_config
+        params = gen_vision_config["params"]
+        return {
+            "codebook_size": params.get("image_token_size", 16384),
+            "codebook_embed_dim": params.get("n_embed", 8),
+        }

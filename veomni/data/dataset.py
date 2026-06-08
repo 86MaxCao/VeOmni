@@ -72,14 +72,21 @@ class MappingDataset(Dataset):
 
 
 class IterativeDataset(IterableDataset):
-    def __init__(self, data: "HFIterableDataset", transform: Optional[Callable] = None):
+    def __init__(self, data: "HFIterableDataset", transform: Optional[Callable] = None, silent_exception: bool = False):
         self._data = data
         self._transform = transform
+        self._silent_exception = silent_exception
 
     def __iter__(self):
         for sample in self._data:
             if self._transform is not None:
-                yield self._transform(sample)
+                try:
+                    yield self._transform(sample)
+                except Exception as e:
+                    if self._silent_exception:
+                        logger.warning(f"Skipping sample due to error: {e}")
+                        continue
+                    raise
             else:
                 yield sample
 
@@ -1174,9 +1181,10 @@ def build_iterable_dataset(
         parallel_state = get_parallel_state()
         dataset = split_dataset_by_node(dataset, parallel_state.dp_rank, parallel_state.dp_size)
 
+    silent_exception = kwargs.get("silent_exception", False)
     if transform:
         transform = partial(transform, source_name=source_name)
-    return IterativeDataset(dataset, transform=transform)
+    return IterativeDataset(dataset, transform=transform, silent_exception=silent_exception)
 
 
 @DATASET_REGISTRY.register("interleave")

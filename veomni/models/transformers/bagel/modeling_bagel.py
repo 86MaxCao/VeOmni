@@ -1297,6 +1297,8 @@ class BagelOutput(ModelOutput):
 class BagelForConditionalGeneration(PreTrainedModel):
     config_class = BagelConfig
     base_model_prefix = "bagel"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["Qwen2DecoderLayer", "Qwen2MoTDecoderLayer", "SiglipEncoderLayer"]
 
     def __init__(self, config: BagelConfig):
         super().__init__(config)
@@ -1369,6 +1371,7 @@ class BagelForConditionalGeneration(PreTrainedModel):
         packed_vae_token_indexes: Optional[torch.LongTensor] = None,
         packed_timesteps: Optional[torch.LongTensor] = None,
         mse_loss_indexes: Optional[torch.BoolTensor] = None,
+        **kwargs,
     ) -> BagelOutput:
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros(size=(sequence_length, self.hidden_size))
@@ -1388,6 +1391,8 @@ class BagelForConditionalGeneration(PreTrainedModel):
             packed_vit_token_embed = self.connector(packed_vit_token_embed)
             vit_token_pos_emb = self.vit_pos_embed(packed_vit_position_ids)
             packed_vit_token_embed = packed_vit_token_embed + vit_token_pos_emb
+            if getattr(self.config, "freeze_und", False):
+                packed_vit_token_embed = packed_vit_token_embed.detach()
             packed_sequence[packed_vit_token_indexes] = packed_vit_token_embed
 
         if self.config.visual_gen and padded_latent is not None:
@@ -1439,7 +1444,10 @@ class BagelForConditionalGeneration(PreTrainedModel):
 
         ce_loss = None
         if ce_loss_indexes is not None:
-            packed_ce_preds = self.language_model.lm_head(last_hidden_state[ce_loss_indexes])
+            ce_hidden = last_hidden_state[ce_loss_indexes]
+            if getattr(self.config, "freeze_und", False):
+                ce_hidden = ce_hidden.detach()
+            packed_ce_preds = self.language_model.lm_head(ce_hidden)
             ce_loss = F.cross_entropy(packed_ce_preds, packed_label_ids)
 
         loss = None
