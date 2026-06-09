@@ -113,13 +113,11 @@ python tasks/infer/infer_unified.py \
 
 ## 4. Image Editing (it2i) Alignment
 
-4 models (Bagel, ThinkMorph, U1, LatentUM) support image editing. VeOmni outputs are aligned with official implementations under the same input and seed.
+3 models (Bagel, ThinkMorph, U1) support image editing: given a source image and an editing instruction, the model generates the edited image. VeOmni outputs are aligned with official implementations under the same input and seed.
 
-- **Bagel, ThinkMorph, U1**: Standard image editing — given a source image and an editing instruction, the model generates the edited image.
-- **LatentUM**: Does not support general image editing. Instead, we use its **World Model (LatentUM-WM)** for next-frame prediction: given 4 context frames and navigation actions, it predicts the next observation. This video-generation capability serves as a proxy for image editing evaluation.
+> **Note:** LatentUM does not support general image editing — it is a navigation world model (next-frame prediction) and is excluded from this section.
 
-Edit prompt (Bagel/ThinkMorph/U1): *"Add a red arrow pointing from the center of the image to the top-right corner."*
-WM action (LatentUM): *Action(0.23, 0.01, 7)* — move forward 0.23m, shift right 0.01m, rotate 7°
+Edit prompt: *"Add a red arrow pointing from the center of the image to the top-right corner."*
 
 <table>
 <tr>
@@ -146,15 +144,9 @@ WM action (LatentUM): *Action(0.23, 0.01, 7)* — move forward 0.23m, shift righ
 <td><img src="assets/u1_it2i_official.png" width="200"></td>
 <td><img src="assets/u1_it2i_veomni.png" width="200"></td>
 </tr>
-<tr>
-<td><b>LatentUM-WM</b><br>(448×448, next-frame)</td>
-<td><img src="assets/latentum_it2i_input.png" width="200"></td>
-<td><img src="assets/latentum_it2i_official.png" width="200"></td>
-<td><img src="assets/latentum_it2i_veomni.png" width="200"></td>
-</tr>
 </table>
 
-**Usage (Bagel/ThinkMorph/U1):**
+**Usage:**
 
 ```python
 from draw_to_understand.models.veomni_bagel import VeOmniBagelGenerationBackend
@@ -168,28 +160,6 @@ backend = VeOmniBagelGenerationBackend(
 input_image = Image.open("input.png").convert("RGB")
 output_image = backend.draw(input_image, "Add a red arrow to the top-right corner.")
 output_image.save("edited.png")
-```
-
-**Usage (LatentUM World Model):**
-
-```python
-from draw_to_understand.models.veomni_latentum import VeOmniLatentUMGenerationBackend
-from PIL import Image
-
-backend = VeOmniLatentUMGenerationBackend(
-    model_path="/path/to/LatentUM-WM",
-    decoder_path="/path/to/LatentUM-Decoder-Ref",
-    device="cuda:0",
-)
-
-context_images = [Image.open(f"frame_{i}.png").convert("RGB") for i in range(4)]
-output_image = backend.draw(
-    context_images[-1],
-    prompt="Action(0.23, 0.01, 7)",
-    context_images=context_images,
-    actions=["Action(0.23, 0.01, 5)", "Action(0.22, 0.01, 6)", "Action(0.23, 0.02, 7)"],
-)
-output_image.save("next_frame.png")
 ```
 
 ## 5. Understanding SFT Training Alignment
