@@ -1,108 +1,217 @@
-
 > **Fork Note (AMD ROCm Adaptation)**
 >
-> This branch (`feat/unified-amd`) adapts **6 unified multimodal models** (understanding + generation) into the VeOmni framework for ablation experiments.
->
-> | Model | model_type | LLM Backbone | Generation Method | Params |
-> |-------|-----------|-------------|-------------------|--------|
-> | [Bagel](https://github.com/ByteDance-Seed/Bagel) | `bagel` | Qwen2.5-7B | MoVQGAN (Flow-Matching) | 14.6B |
-> | [ThinkMorph](https://github.com/ThinkMorph/ThinkMorph) | `thinkmorph` | Qwen2.5-7B | MoVQGAN (Flow-Matching + CoT) | 14.6B |
-> | [BLIP3o](https://github.com/JiuhaiChen/BLIP3o) | `blip3o_qwen` | Qwen2.5-7B | Diffusion (DIT + VAE) | 14.1B |
-> | [SenseNova-U1](https://github.com/OpenSenseNova/SenseNova-U1) | `neo_chat` | NEO (Qwen3-arch, 42L) | Flow-Matching (MoT) | 17.6B |
-> | [LatentUM](https://github.com/SJTU-DENG-Lab/LatentUM) | `latentum` | InternVL3.5-4B | MoT Discrete Tokens (AR Head) | 8.8B |
-> | [Janus-Pro](https://github.com/deepseek-ai/Janus) | `janus` | DeepSeek-LLM-7B | VQ-16 Discrete Tokens (AR) | 7.4B |
->
-> **Inference Alignment (validated against official implementations):**
->
-> All 6 models produce **identical outputs** to their official repos when given the same inputs.
-> Tested on VisPuzzle benchmark (multiple-choice VQA):
->
-> | Model | Alignment | Test Samples | Official Accuracy |
-> |-------|-----------|-------------|-------------------|
-> | Bagel | 100% | 20/20 exact match | 33.8% |
-> | ThinkMorph | 100% | 5/5 exact match | 36.5% |
-> | BLIP3o | 100% | 10/10 exact match | 36.8% |
-> | SenseNova-U1 | 100% | 10/10 exact match | 68.5% |
-> | LatentUM | 100% | 3/3 exact match | 38.5% |
-> | Janus-Pro | 100% | 3/3 exact match | 33.2% |
->
-> **Training Alignment (Understanding SFT, CE loss on text tokens):**
->
-> All 6 models produce **aligned CE loss** to their official training code with the same inputs.
-> Verified by running official model code from `ablation_experiment/` repos with same seed & sequence.
->
-> | Model | VeOmni CE Loss | Official CE Loss | Diff | Grad Params |
-> |-------|---------------|-----------------|------|-------------|
-> | Bagel | 14.7230 | 14.7230 | 9.54e-7 | 395 |
-> | ThinkMorph | 14.7230 | 14.7230 | 9.54e-7 | 395 |
-> | BLIP3o | 13.3495 | 13.3964 | 0.047 | 311 |
-> | SenseNova-U1 | 13.0480 | 13.0480 | 0.000 | 549 |
-> | LatentUM | 12.7729 | 12.7839 | 0.011 | 399 |
-> | Janus-Pro | 13.6453 | N/A (no official training code) | — | 282 |
->
-> **Generation Alignment (Text-to-Image, same prompt & seed):**
->
-> All 6 models produce valid generated images through VeOmni's unified pipeline.
-> Prompt: *"Add a blue circle in the center of this image"*
->
-> <table>
-> <tr>
-> <th>Model</th>
-> <th>Official</th>
-> <th>VeOmni</th>
-> </tr>
-> <tr>
-> <td><b>Bagel</b></td>
-> <td><img src="assets/bagel_official_prompt2.png" width="256"></td>
-> <td><img src="assets/bagel_prompt2.png" width="256"></td>
-> </tr>
-> <tr>
-> <td><b>ThinkMorph</b></td>
-> <td><img src="assets/thinkmorph_official_prompt2.png" width="256"></td>
-> <td><img src="assets/thinkmorph_prompt2.png" width="256"></td>
-> </tr>
-> <tr>
-> <td><b>BLIP3o</b></td>
-> <td><img src="assets/blip3o_official_prompt2.png" width="256"></td>
-> <td><img src="assets/blip3o_prompt2.png" width="256"></td>
-> </tr>
-> <tr>
-> <td><b>SenseNova-U1</b></td>
-> <td><img src="assets/u1_official_prompt2.png" width="256"></td>
-> <td><img src="assets/u1_prompt2.png" width="256"></td>
-> </tr>
-> <tr>
-> <td><b>LatentUM</b></td>
-> <td><img src="assets/latentum_official_prompt2.png" width="256"></td>
-> <td><img src="assets/latentum_prompt2.png" width="256"></td>
-> </tr>
-> <tr>
-> <td><b>Janus-Pro</b></td>
-> <td><img src="assets/janus_official_prompt2.png" width="256"></td>
-> <td><img src="assets/janus_prompt2.png" width="256"></td>
-> </tr>
-> </table>
+> This branch (`feat/unified-amd`) adapts **6 unified multimodal models** (understanding + generation) into the VeOmni framework for ablation experiments. All model implementations are **aligned with official code** — inference outputs and training losses are verified to match.
 >
 > **Environment:**
 > - GPU: AMD Instinct MI308X (192GB HBM3)
 > - Platform: ROCm 7.0 + PyTorch 2.10.0+rocm7.0
 > - Python: 3.11
 > - Flash Attention: flash_attn 2.7.3 (ROCm)
->
-> **Usage:**
-> ```bash
-> # Understanding (VQA, unified entry for all 6 models)
-> python tasks/infer/infer_unified.py --model_type bagel --mode understand --prompt "Describe this image" --image img.jpg
-> python tasks/infer/infer_unified.py --model_type u1 --mode understand --prompt "What is shown?" --image img.jpg
->
-> # Generation (Text-to-Image)
-> python tasks/infer/infer_unified.py --model_type bagel --mode generate --prompt "A cat sitting on a windowsill" --output output.png
-> python tasks/infer/infer_unified.py --model_type u1 --mode generate --prompt "A blue circle on white background" --output output.png
->
-> # Training (SFT)
-> torchrun --nproc_per_node=1 tasks/train_unified.py --config configs/multimodal/bagel/sft.yaml
-> ```
->
+
+## 1. Supported Models
+
+| Model | model_type | LLM Backbone | Generation Method | Params |
+|-------|-----------|-------------|-------------------|--------|
+| [Bagel](https://github.com/ByteDance-Seed/Bagel) | `bagel` | Qwen2.5-7B | MoVQGAN (Flow-Matching) | 14.6B |
+| [ThinkMorph](https://github.com/ThinkMorph/ThinkMorph) | `thinkmorph` | Qwen2.5-7B | MoVQGAN (Flow-Matching + CoT) | 14.6B |
+| [BLIP3o](https://github.com/JiuhaiChen/BLIP3o) | `blip3o_qwen` | Qwen2.5-7B | Diffusion (DIT + VAE) | 14.1B |
+| [SenseNova-U1](https://github.com/OpenSenseNova/SenseNova-U1) | `neo_chat` | NEO (Qwen3-arch, 42L) | Flow-Matching (MoT) | 17.6B |
+| [LatentUM](https://github.com/SJTU-DENG-Lab/LatentUM) | `latentum` | InternVL3.5-4B | MoT Discrete Tokens (AR Head) | 8.8B |
+| [Janus-Pro](https://github.com/deepseek-ai/Janus) | `janus` | DeepSeek-LLM-7B | VQ-16 Discrete Tokens (AR) | 7.4B |
+
+## 2. Multimodal Understanding Inference Alignment
+
+All 6 models produce **identical outputs** to their official repos when given the same inputs.
+Tested on VisPuzzle benchmark (multiple-choice VQA):
+
+| Model | Alignment | Test Samples | Official Accuracy |
+|-------|-----------|-------------|-------------------|
+| Bagel | 100% | 20/20 exact match | 33.8% |
+| ThinkMorph | 100% | 5/5 exact match | 36.5% |
+| BLIP3o | 100% | 10/10 exact match | 36.8% |
+| SenseNova-U1 | 100% | 10/10 exact match | 68.5% |
+| LatentUM | 100% | 3/3 exact match | 38.5% |
+| Janus-Pro | 100% | 3/3 exact match | 33.2% |
+
+**Usage:**
+
+```bash
+# Unified entry for all 6 models
+python tasks/infer/infer_unified.py \
+    --model_type bagel \
+    --mode understand \
+    --prompt "Describe this image" \
+    --image img.jpg
+
+python tasks/infer/infer_unified.py \
+    --model_type u1 \
+    --mode understand \
+    --prompt "What is shown?" \
+    --image img.jpg
+```
+
+## 3. Text-to-Image Generation Alignment
+
+All 6 models produce valid generated images through VeOmni's unified pipeline, aligned with official implementations under the same prompt and seed.
+
+Prompt: *"Add a blue circle in the center of this image"*
+
+<table>
+<tr>
+<th>Model</th>
+<th>Official</th>
+<th>VeOmni</th>
+</tr>
+<tr>
+<td><b>Bagel</b></td>
+<td><img src="assets/bagel_official_prompt2.png" width="256"></td>
+<td><img src="assets/bagel_prompt2.png" width="256"></td>
+</tr>
+<tr>
+<td><b>ThinkMorph</b></td>
+<td><img src="assets/thinkmorph_official_prompt2.png" width="256"></td>
+<td><img src="assets/thinkmorph_prompt2.png" width="256"></td>
+</tr>
+<tr>
+<td><b>BLIP3o</b></td>
+<td><img src="assets/blip3o_official_prompt2.png" width="256"></td>
+<td><img src="assets/blip3o_prompt2.png" width="256"></td>
+</tr>
+<tr>
+<td><b>SenseNova-U1</b></td>
+<td><img src="assets/u1_official_prompt2.png" width="256"></td>
+<td><img src="assets/u1_prompt2.png" width="256"></td>
+</tr>
+<tr>
+<td><b>LatentUM</b></td>
+<td><img src="assets/latentum_official_prompt2.png" width="256"></td>
+<td><img src="assets/latentum_prompt2.png" width="256"></td>
+</tr>
+<tr>
+<td><b>Janus-Pro</b></td>
+<td><img src="assets/janus_official_prompt2.png" width="256"></td>
+<td><img src="assets/janus_prompt2.png" width="256"></td>
+</tr>
+</table>
+
+**Usage:**
+
+```bash
+# Text-to-Image generation
+python tasks/infer/infer_unified.py \
+    --model_type bagel \
+    --mode generate \
+    --prompt "A cat sitting on a windowsill" \
+    --output output.png
+
+python tasks/infer/infer_unified.py \
+    --model_type u1 \
+    --mode generate \
+    --prompt "A blue circle on white background" \
+    --output output.png
+```
+
+## 4. Image Editing (it2i) Alignment
+
+4 models (Bagel, ThinkMorph, U1, LatentUM) support image editing: given a source image and an editing instruction, the model generates the edited image. VeOmni outputs are aligned with official implementations under the same input and seed.
+
+Edit prompt: *"Add a red arrow pointing from the center of the image to the top-right corner."*
+
+<table>
+<tr>
+<th>Model</th>
+<th>Input</th>
+<th>Official</th>
+<th>VeOmni</th>
+</tr>
+<tr>
+<td><b>Bagel</b><br>(1024×1024)</td>
+<td><img src="assets/bagel_it2i_input.png" width="200"></td>
+<td><img src="assets/bagel_it2i_official.png" width="200"></td>
+<td><img src="assets/bagel_it2i_veomni.png" width="200"></td>
+</tr>
+<tr>
+<td><b>ThinkMorph</b><br>(1024×1024)</td>
+<td><img src="assets/thinkmorph_it2i_input.png" width="200"></td>
+<td><img src="assets/thinkmorph_it2i_official.png" width="200"></td>
+<td><img src="assets/thinkmorph_it2i_veomni.png" width="200"></td>
+</tr>
+<tr>
+<td><b>SenseNova-U1</b><br>(1280×1280)</td>
+<td><img src="assets/u1_it2i_input.png" width="200"></td>
+<td><img src="assets/u1_it2i_official.png" width="200"></td>
+<td><img src="assets/u1_it2i_veomni.png" width="200"></td>
+</tr>
+<tr>
+<td><b>LatentUM</b><br>(448×448)</td>
+<td><img src="assets/latentum_it2i_input.png" width="200"></td>
+<td><img src="assets/latentum_it2i_official.png" width="200"></td>
+<td><img src="assets/latentum_it2i_veomni.png" width="200"></td>
+</tr>
+</table>
+
+**Usage:**
+
+```python
+from draw_to_understand.models.veomni_bagel import VeOmniBagelGenerationBackend
+from PIL import Image
+
+backend = VeOmniBagelGenerationBackend(
+    model_path="/path/to/BAGEL-7B-MoT",
+    device="cuda:0",
+)
+
+input_image = Image.open("input.png").convert("RGB")
+output_image = backend.draw(input_image, "Add a red arrow to the top-right corner.")
+output_image.save("edited.png")
+```
+
+```python
+from draw_to_understand.models.veomni_u1 import VeOmniU1GenerationBackend
+from PIL import Image
+
+backend = VeOmniU1GenerationBackend(
+    model_path="/path/to/SenseNova-U1-8B-MoT",
+    device="cuda:0",
+)
+
+input_image = Image.open("input.png").convert("RGB")
+output_image = backend.draw(input_image, "Draw a route from A to B on the map.")
+output_image.save("edited.png")
+```
+
+## 5. Understanding SFT Training Alignment
+
+All 6 models produce **aligned CE loss** to their official training code with the same inputs.
+Verified by running official model code from `ablation_experiment/` repos with same seed & sequence.
+
+| Model | VeOmni CE Loss | Official CE Loss | Diff | Grad Params |
+|-------|---------------|-----------------|------|-------------|
+| Bagel | 14.7230 | 14.7230 | 9.54e-7 | 395 |
+| ThinkMorph | 14.7230 | 14.7230 | 9.54e-7 | 395 |
+| BLIP3o | 13.3495 | 13.3964 | 0.047 | 311 |
+| SenseNova-U1 | 13.0480 | 13.0480 | 0.000 | 549 |
+| LatentUM | 12.7729 | 12.7839 | 0.011 | 399 |
+| Janus-Pro | 13.6453 | N/A (no official training code) | — | 282 |
+
+**Usage:**
+
+```bash
+# Single-GPU SFT (any of the 6 models)
+torchrun --nproc_per_node=1 tasks/train_unified.py \
+    --config configs/multimodal/bagel/sft.yaml
+
+# Multi-GPU SFT with FSDP
+torchrun --nproc_per_node=8 tasks/train_unified.py \
+    --config configs/multimodal/u1/sft.yaml
+
+# ThinkMorph SFT
+torchrun --nproc_per_node=1 tasks/train_unified.py \
+    --config configs/multimodal/thinkmorph/sft.yaml
+```
+
+Each model has a dedicated config under `configs/multimodal/{model_type}/sft.yaml`.
+
 > See per-model branches: `feat/bagel-amd`, `feat/thinkmorph-amd`, `feat/blip3o-amd`, `feat/sensenova-u1-amd`, `feat/latentum-amd`
 
 ---

@@ -821,8 +821,9 @@ class InternVLChatModel(nn.Module):
         if vit_features.dim() == 3:
             b, n, d = vit_features.shape
             h = w = int(n ** 0.5)
+            # Remove CLS token (position 0) — official extract_feature does vit_embeds[:, 1:, :]
             if h * w < n:
-                vit_features = vit_features[:, :h * w, :]
+                vit_features = vit_features[:, 1:h * w + 1, :]
                 n = h * w
             ds = int(1 / self.config.downsample_ratio)
             if h % ds == 0 and w % ds == 0:
@@ -979,6 +980,10 @@ class LatentUMModel(PreTrainedModel):
                 if vit_features.dim() == 3:
                     b, n, d = vit_features.shape
                     h = w = int(n ** 0.5)
+                    # Remove CLS token (position 0) — official extract_feature does vit_embeds[:, 1:, :]
+                    if h * w < n:
+                        vit_features = vit_features[:, 1:h * w + 1, :]
+                        n = h * w
                     ds = int(1 / self.config.internvl_config.downsample_ratio)
                     if h % ds == 0 and w % ds == 0:
                         vit_features = vit_features.reshape(b, h, w, d)
@@ -1347,6 +1352,138 @@ class LatentUMModel(PreTrainedModel):
         # generated_code from AR head is (B, K) when no CFG, or (B_half, K) with CFG
         # Stack along position dim
         return torch.stack(generated_codes, dim=1)  # (B, 256, K)
+
+    @torch.inference_mode()
+    def generate_latents_with_images(
+        self,
+        tokenizer,
+        prompt_text: str,
+        pixel_values: torch.Tensor,
+        *,
+        temperature: float = 0.9,
+        top_k: int = 50,
+        top_p: float = 0.95,
+        seed: int | None = None,
+        verbose: bool = False,
+    ) -> torch.Tensor:
+        """Generate discrete latent codes conditioned on source images.
+
+        Aligned with official world_model.py _generate_next_frame_codes().
+        No CFG (cfg_scale=1.0), consistent with official it2i generation.
+
+        Args:
+            tokenizer: HF tokenizer.
+            prompt_text: prompt containing <img><IMG_CONTEXT>*N</img> blocks
+                for each source image. Must NOT end with the generation
+                trigger <img> — that is appended automatically.
+            pixel_values: [N_images, C, H, W] ImageNet-normalized source images.
+            temperature, top_k, top_p: sampling parameters.
+            seed: random seed.
+            verbose: show progress bar.
+        Returns:
+            (1, num_image_tokens, K) tensor of codebook indices.
+        """
+        from tqdm import trange
+
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+        num_image_tokens = self.config.num_image_tokens
+
+        if seed is not None:
+            torch.manual_seed(seed)
+
+        sampling_kwargs = {
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
+            "sample_logits": True,
+        }
+
+        # Step 1: Encode context images — ViT → pixel_shuffle → mlp1
+        # (same path as forward() lines 974-987)
+        vit_features = self.internvl.vision_model(pixel_values)
+        if vit_features.dim() == 3:
+            b, n, d = vit_features.shape
+            h = w = int(n ** 0.5)
+            # Remove CLS token (position 0) — official extract_feature does vit_embeds[:, 1:, :]
+            if h * w < n:
+                vit_features = vit_features[:, 1:h * w + 1, :]
+                n = h * w
+            ds = int(1 / self.config.internvl_config.downsample_ratio)
+            if h % ds == 0 and w % ds == 0:
+                vit_features = vit_features.reshape(b, h, w, d)
+                vit_features = vit_features.reshape(b, h // ds, ds, w // ds, ds, d)
+                vit_features = vit_features.permute(0, 1, 3, 2, 4, 5).reshape(
+                    b, (h // ds) * (w // ds), d * ds * ds
+                )
+        visual_emb = self.internvl.mlp1(vit_features)  # [N_images, num_image_tokens, D]
+
+        # Step 2: Tokenize and inject visual embeddings at <IMG_CONTEXT> positions
+        img_context_token_id = tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
+        img_start_token_id = tokenizer.convert_tokens_to_ids("<img>")
+
+        tokenizer_output = tokenizer(
+            [prompt_text],
+            padding=True,
+            padding_side="left",
+            truncation=False,
+            return_tensors="pt",
+        )
+        input_ids = tokenizer_output["input_ids"].to(device)
+        attention_mask = tokenizer_output["attention_mask"].to(device)
+        input_embeds = self.get_input_embeddings()(input_ids).clone()
+
+        img_positions = (input_ids[0] == img_context_token_id).nonzero(as_tuple=True)[0]
+        n_images = pixel_values.shape[0]
+        for src_idx in range(n_images):
+            start = src_idx * num_image_tokens
+            end = start + num_image_tokens
+            input_embeds[0, img_positions[start:end]] = visual_emb[src_idx]
+
+        # Step 3: Prefill — vision_token_mask=0 (all text for prompt context)
+        _, past_key_values = self._llm_forward_cached(
+            input_embeds,
+            vision_token_mask=torch.zeros(1, input_embeds.shape[1], device=device, dtype=dtype),
+            past_key_values=None,
+            attention_mask=attention_mask,
+        )
+
+        # Step 4: <img> start token — vision_token_mask=1 (generation trigger)
+        img_embed = self.get_input_embeddings()(
+            torch.tensor([[img_start_token_id]], device=device)
+        )
+        hidden_states, past_key_values = self._llm_forward_cached(
+            img_embed,
+            vision_token_mask=torch.ones(1, 1, device=device, dtype=dtype),
+            past_key_values=past_key_values,
+        )
+
+        # Step 5: 256-step AR generation loop (no CFG, cfg_scale=1.0)
+        generated_codes = []
+        code = self.internvl.ar_head.generate_from_base_token(
+            hidden_states,
+            cfg_scale=1.0,
+            sampling_kwargs=sampling_kwargs,
+        )
+        generated_codes.append(code)
+
+        iterator = trange(num_image_tokens - 1, desc="Generating it2i latents") if verbose else range(num_image_tokens - 1)
+        for _ in iterator:
+            z_q, _ = self.quantizer.indices_to_feature(code.unsqueeze(1))
+            current_input = self.internvl.visual_projector(z_q)
+            hidden_states, past_key_values = self._llm_forward_cached(
+                current_input,
+                vision_token_mask=torch.ones(1, 1, device=device, dtype=dtype),
+                past_key_values=past_key_values,
+            )
+            code = self.internvl.ar_head.generate_from_base_token(
+                hidden_states,
+                cfg_scale=1.0,
+                sampling_kwargs=sampling_kwargs,
+            )
+            generated_codes.append(code)
+
+        return torch.stack(generated_codes, dim=1)  # (1, num_image_tokens, K)
 
     @torch.inference_mode()
     def generate_images(
