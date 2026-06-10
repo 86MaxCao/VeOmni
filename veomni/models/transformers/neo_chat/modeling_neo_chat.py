@@ -14,6 +14,7 @@ enabling both temporal (causal text) and spatial (image patch) position awarenes
 
 import copy
 import math
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -62,6 +63,17 @@ except ImportError:
     flash_attn_func = None
     _HAS_FLASH_ATTN = False
 
+try:
+    from torch.nn.attention.flex_attention import flex_attention as _flex_attention_raw, create_block_mask, and_masks, or_masks
+    import os
+    if os.environ.get("FLEX_NO_COMPILE", "0") == "1":
+        flex_attention = _flex_attention_raw
+    else:
+        flex_attention = torch.compile(_flex_attention_raw, dynamic=True)
+    _HAS_FLEX_ATTN = True
+except Exception:
+    _HAS_FLEX_ATTN = False
+
 
 # ---------------------------------------------------------------------------
 # Attention backend utilities
@@ -92,6 +104,82 @@ def _flash_or_sdpa(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False):
     if _HAS_FLASH_ATTN and q.device.type == "cuda":
         return flash_attn_func(q, k, v, dropout_p=dropout_p, softmax_scale=softmax_scale, causal=causal)
     return _sdpa_attn_func(q, k, v, dropout_p=dropout_p, softmax_scale=softmax_scale, causal=causal)
+
+
+# ---------------------------------------------------------------------------
+# Flex Attention mask construction (aligned with official SenseNova-U1)
+# ---------------------------------------------------------------------------
+
+
+def _build_flex_mask_for_training(
+    modality_indicators: torch.Tensor,
+    image_gen_indicators: torch.Tensor,
+    seq_len: int,
+    device: torch.device,
+):
+    """Build flex_attention block_mask for U1 mixed training.
+
+    Aligned with official create_flex_mask_padding_image_gen (simplified: no ISP, no dup_boundary).
+
+    Mask rules:
+    1. Same-document causal attention (we have single doc, so just causal)
+    2. Same-image full attention (bidirectional within same image)
+    3. Gen token isolation: non-gen tokens cannot attend to gen tokens;
+       gen tokens only attend to same-image gen tokens
+    """
+    if not _HAS_FLEX_ATTN:
+        return None, 0
+
+    div_num = 128
+    padlen = (div_num - seq_len % div_num) % div_num
+
+    if padlen > 0:
+        modality_indicators = torch.nn.functional.pad(modality_indicators, (0, padlen), value=-1)
+        image_gen_indicators = torch.nn.functional.pad(image_gen_indicators, (0, padlen), value=False)
+
+    padded_len = seq_len + padlen
+
+    def causal_mask(b, h, q_idx, kv_idx):
+        return q_idx >= kv_idx
+
+    def sameimg_mask(b, h, q_idx, kv_idx):
+        is_image = modality_indicators[q_idx] > 0
+        return is_image & (modality_indicators[q_idx] == modality_indicators[kv_idx])
+
+    causal_or_sameimg = or_masks(causal_mask, sameimg_mask)
+
+    def gen_kv_gate_mask(b, h, q_idx, kv_idx):
+        kv_is_gen = image_gen_indicators[kv_idx]
+        q_is_gen = image_gen_indicators[q_idx]
+        same_img = (modality_indicators[q_idx] == modality_indicators[kv_idx]) & (modality_indicators[q_idx] > 0)
+        # Non-gen can't attend to gen; gen can only attend to same-image gen
+        return (~kv_is_gen) | (q_is_gen & same_img)
+
+    mask_mod = and_masks(causal_or_sameimg, gen_kv_gate_mask)
+
+    block_mask = create_block_mask(
+        mask_mod,
+        B=None,
+        H=None,
+        Q_LEN=padded_len,
+        KV_LEN=padded_len,
+        BLOCK_SIZE=128,
+        _compile=True,
+    )
+
+    return block_mask, padlen
+
+
+def _build_modality_indicators_from_input_ids(input_ids, img_start_token_id, img_context_token_id):
+    """Build modality_indicators: -1 for text, image_id (1-indexed) for image tokens.
+
+    Aligned with official: cumsum over img_start shifted flags, masked to only IMG_CONTEXT positions.
+    """
+    img_start_flags = (input_ids == img_start_token_id).long()
+    shifted_flags = torch.cat([torch.zeros(1, dtype=torch.long, device=input_ids.device), img_start_flags], dim=0)[:-1]
+    modality_indicators = shifted_flags.cumsum(0)
+    modality_indicators[input_ids != img_context_token_id] = -1
+    return modality_indicators
 
 
 # ---------------------------------------------------------------------------
@@ -625,7 +713,7 @@ class Qwen3Attention(nn.Module):
         return self.forward_und(hidden_states, indexes, attention_mask, past_key_values, **kwargs)
 
     def forward_und(self, hidden_states, indexes, attention_mask, past_key_values=None, **kwargs):
-        """Forward pass for understanding path."""
+        """Forward pass for understanding path (flex_attention or flash_attn)."""
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -655,25 +743,114 @@ class Qwen3Attention(nn.Module):
         cos_w, sin_w = self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0))
         query_states_w, key_states_w = _apply_rotary_pos_emb(query_states_w, key_states_w, cos_w, sin_w)
 
-        # Concatenate all parts
+        # Concatenate all parts: [B, H, S, D]
         query_states = torch.cat([query_states_t, query_states_h, query_states_w], dim=-1)
         key_states = torch.cat([key_states_t, key_states_h, key_states_w], dim=-1)
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        # Eager attention
-        key_states_expanded = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
-        value_states_expanded = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
+        # Use flex_attention with block_mask if provided (training), else flash_attn (inference)
+        flex_mask = kwargs.get("flex_mask", None)
+        padlen = kwargs.get("padlen", 0)
 
-        attn_weights = torch.matmul(query_states, key_states_expanded.transpose(2, 3)) * self.scaling
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask[:, :, :, : key_states_expanded.shape[-2]]
+        if flex_mask is not None and _HAS_FLEX_ATTN:
+            # flex_attention expects [B, H, S, D] layout
+            q = query_states  # already [B, H, S, D]
+            k = key_states
+            v = value_states
+            if padlen > 0:
+                q = torch.nn.functional.pad(q, (0, 0, 0, padlen))
+                k = torch.nn.functional.pad(k, (0, 0, 0, padlen))
+                v = torch.nn.functional.pad(v, (0, 0, 0, padlen))
+            attn_output = flex_attention(
+                q, k, v,
+                enable_gqa=True,
+                block_mask=flex_mask,
+                scale=self.scaling,
+            )
+            if padlen > 0:
+                attn_output = attn_output[:, :, :attn_output.shape[2] - padlen, :]
+            attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+        else:
+            # Flash attention fallback: [B, S, H, D] layout
+            q = query_states.transpose(1, 2).contiguous()
+            k = key_states.transpose(1, 2).contiguous()
+            v = value_states.transpose(1, 2).contiguous()
+            attn_output = _flash_or_sdpa(q, k, v, dropout_p=0.0, softmax_scale=self.scaling, causal=True)
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
 
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states_expanded)
-        attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
+        return attn_output, None
+
+    def forward_mixed(self, hidden_states, num_gen_tokens, indexes, attention_mask, past_key_values=None, **kwargs):
+        """Mixed MoT attention: gen tokens use _mot_gen projections, und tokens use standard.
+        Sequence is packed: [gen_tokens..., und_tokens...]. Shared attention computation."""
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        gen_h = hidden_states[:, :num_gen_tokens, :]
+        und_h = hidden_states[:, num_gen_tokens:, :]
+
+        query_states = torch.cat([self.q_proj_mot_gen(gen_h), self.q_proj(und_h)], dim=1).view(hidden_shape)
+        key_states = torch.cat([self.k_proj_mot_gen(gen_h), self.k_proj(und_h)], dim=1).view(hidden_shape)
+        value_states = torch.cat([self.v_proj_mot_gen(gen_h), self.v_proj(und_h)], dim=1).view(hidden_shape).transpose(1, 2)
+
+        query_states_t, query_states_hw = query_states.chunk(2, dim=-1)
+        key_states_t, key_states_hw = key_states.chunk(2, dim=-1)
+
+        # Apply QK norms (split by gen/und) then merge back
+        q_t_gen = self.q_norm_mot_gen(query_states_t[:, :num_gen_tokens])
+        q_t_und = self.q_norm(query_states_t[:, num_gen_tokens:])
+        query_states_t = torch.cat([q_t_gen, q_t_und], dim=1).transpose(1, 2)
+
+        k_t_gen = self.k_norm_mot_gen(key_states_t[:, :num_gen_tokens])
+        k_t_und = self.k_norm(key_states_t[:, num_gen_tokens:])
+        key_states_t = torch.cat([k_t_gen, k_t_und], dim=1).transpose(1, 2)
+
+        query_states_hw = query_states_hw.transpose(1, 2)
+        key_states_hw = key_states_hw.transpose(1, 2)
+        query_states_h, query_states_w = query_states_hw.chunk(2, dim=-1)
+        key_states_h, key_states_w = key_states_hw.chunk(2, dim=-1)
+
+        # Apply temporal RoPE
+        cos_t, sin_t = self.rotary_emb(hidden_states, indexes[0].unsqueeze(0))
+        query_states_t, key_states_t = _apply_rotary_pos_emb(query_states_t, key_states_t, cos_t, sin_t)
+
+        # Apply spatial RoPE (h, w)
+        cos_h, sin_h = self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0))
+        query_states_h, key_states_h = _apply_rotary_pos_emb(query_states_h, key_states_h, cos_h, sin_h)
+        cos_w, sin_w = self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0))
+        query_states_w, key_states_w = _apply_rotary_pos_emb(query_states_w, key_states_w, cos_w, sin_w)
+
+        query_states = torch.cat([query_states_t, query_states_h, query_states_w], dim=-1)
+        key_states = torch.cat([key_states_t, key_states_h, key_states_w], dim=-1)
+
+        # Attention computation (shared)
+        flex_mask = kwargs.get("flex_mask", None)
+        padlen = kwargs.get("padlen", 0)
+
+        if flex_mask is not None and _HAS_FLEX_ATTN:
+            q, k, v = query_states, key_states, value_states
+            if padlen > 0:
+                q = torch.nn.functional.pad(q, (0, 0, 0, padlen))
+                k = torch.nn.functional.pad(k, (0, 0, 0, padlen))
+                v = torch.nn.functional.pad(v, (0, 0, 0, padlen))
+            attn_output = flex_attention(q, k, v, enable_gqa=True, block_mask=flex_mask, scale=self.scaling)
+            if padlen > 0:
+                attn_output = attn_output[:, :, :attn_output.shape[2] - padlen, :]
+            attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+        else:
+            q = query_states.transpose(1, 2).contiguous()
+            k = key_states.transpose(1, 2).contiguous()
+            v = value_states.transpose(1, 2).contiguous()
+            attn_output = _flash_or_sdpa(q, k, v, dropout_p=0.0, softmax_scale=self.scaling, causal=True)
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+
+        # Apply output projection (split by gen/und)
+        attn_output = torch.cat([
+            self.o_proj_mot_gen(attn_output[:, :num_gen_tokens, :]),
+            self.o_proj(attn_output[:, num_gen_tokens:, :]),
+        ], dim=1)
         return attn_output, None
 
     def forward_gen(self, hidden_states, indexes, attention_mask, past_key_values=None, **kwargs):
@@ -809,12 +986,13 @@ class Qwen3DecoderLayer(nn.Module):
         **kwargs,
     ):
         """Dispatch to understanding or generation forward based on indicators."""
+        num_gen_tokens = kwargs.pop("num_gen_tokens", 0)
         if image_gen_indicators is None or not image_gen_indicators.any():
             return self._forward_und(hidden_states, indexes, attention_mask, past_key_values, **kwargs)
         elif image_gen_indicators.all():
             return self._forward_gen(hidden_states, indexes, attention_mask, past_key_values, **kwargs)
         else:
-            return self._forward_mixed(hidden_states, image_gen_indicators, indexes, attention_mask, past_key_values, **kwargs)
+            return self._forward_mixed(hidden_states, num_gen_tokens, indexes, attention_mask, past_key_values, **kwargs)
 
     def _forward_und(self, hidden_states, indexes, attention_mask, past_key_values, **kwargs):
         residual = hidden_states
@@ -840,36 +1018,37 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         return hidden_states
 
-    def _forward_mixed(self, hidden_states, image_gen_indicators, indexes, attention_mask, past_key_values, **kwargs):
-        """Mixed path: some tokens are understanding, some are generation."""
+    def _forward_mixed(self, hidden_states, num_gen_tokens, indexes, attention_mask, past_key_values, **kwargs):
+        """Mixed path using contiguous slicing (gen tokens packed first, aligned with official)."""
         residual = hidden_states
-        _hidden = hidden_states.new_zeros(hidden_states.shape)
-        _hidden[~image_gen_indicators] = self.input_layernorm(hidden_states[~image_gen_indicators])
-        _hidden[image_gen_indicators] = self.input_layernorm_mot_gen(hidden_states[image_gen_indicators])
-        hidden_states = _hidden
+        hidden_states = torch.cat([
+            self.input_layernorm_mot_gen(hidden_states[:, :num_gen_tokens, :]),
+            self.input_layernorm(hidden_states[:, num_gen_tokens:, :]),
+        ], dim=1)
 
-        # For mixed path, use understanding attention (shared KV)
-        hidden_states, _ = self.self_attn.forward_und(hidden_states, indexes, attention_mask, past_key_values, **kwargs)
+        hidden_states, _ = self.self_attn.forward_mixed(hidden_states, num_gen_tokens, indexes, attention_mask, past_key_values, **kwargs)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
-        _hidden = hidden_states.new_zeros(hidden_states.shape)
-        _hidden[~image_gen_indicators] = self.mlp(self.post_attention_layernorm(hidden_states[~image_gen_indicators]))
-        _hidden[image_gen_indicators] = self.mlp_mot_gen(
-            self.post_attention_layernorm_mot_gen(hidden_states[image_gen_indicators])
-        )
-        hidden_states = residual + _hidden
+        hidden_states = torch.cat([
+            self.mlp_mot_gen(self.post_attention_layernorm_mot_gen(hidden_states[:, :num_gen_tokens, :])),
+            self.mlp(self.post_attention_layernorm(hidden_states[:, num_gen_tokens:, :])),
+        ], dim=1)
+        hidden_states = residual + hidden_states
         return hidden_states
 
 
 class Qwen3Model(nn.Module):
     """Qwen3 transformer model with MoT support."""
 
+    _supports_gradient_checkpointing = True
+
     def __init__(self, config: NEOLLMConfig):
         super().__init__()
         self.config = config
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
+        self.gradient_checkpointing = False
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
@@ -893,31 +1072,85 @@ class Qwen3Model(nn.Module):
             inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
+        modality_indicators_orig = kwargs.pop("_modality_indicators", None)
 
         exist_gen = image_gen_indicators is not None and image_gen_indicators.any()
         exist_und = image_gen_indicators is None or (~image_gen_indicators).any()
 
-        for decoder_layer in self.layers:
-            hidden_states = decoder_layer(
-                hidden_states,
-                image_gen_indicators=image_gen_indicators,
-                indexes=indexes,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                **kwargs,
-            )
+        # Pack sequence: gen tokens first, und tokens after (aligned with official)
+        # This avoids boolean-indexed scatter which crashes under FSDP2
+        inv_perm = None
+        num_gen_tokens = 0
+        if exist_gen and exist_und:
+            gen_flat = image_gen_indicators.view(-1).bool()
+            gen_idx = torch.nonzero(gen_flat, as_tuple=True)[0]
+            und_idx = torch.nonzero(~gen_flat, as_tuple=True)[0]
+            perm = torch.cat([gen_idx, und_idx], dim=0)
+            inv_perm = torch.empty_like(perm)
+            inv_perm[perm] = torch.arange(perm.shape[0], device=perm.device, dtype=perm.dtype)
+            num_gen_tokens = gen_idx.shape[0]
 
-        # Apply final norm based on token type
+            hidden_states = hidden_states[:, perm, :]
+            if indexes is not None:
+                indexes = indexes[:, perm] if indexes.shape[0] == 3 else indexes[perm]
+
+            # Rebuild flex_mask on packed order (mask must match token order in attention)
+            if kwargs.get("flex_mask") is not None and modality_indicators_orig is not None:
+                packed_gen_indicators = gen_flat[perm]
+                packed_modality = modality_indicators_orig[perm]
+                packed_seq_len = hidden_states.shape[1]
+                new_flex_mask, new_padlen = _build_flex_mask_for_training(
+                    modality_indicators=packed_modality,
+                    image_gen_indicators=packed_gen_indicators,
+                    seq_len=packed_seq_len,
+                    device=hidden_states.device,
+                )
+                kwargs["flex_mask"] = new_flex_mask
+                kwargs["padlen"] = new_padlen
+
+        for decoder_layer in self.layers:
+            if self.gradient_checkpointing and self.training:
+                def create_custom_forward(module):
+                    def custom_forward(hidden_states, image_gen_indicators, indexes, attention_mask, *args, **kw):
+                        return module(hidden_states, image_gen_indicators=image_gen_indicators,
+                                      indexes=indexes, attention_mask=attention_mask,
+                                      num_gen_tokens=num_gen_tokens, **kwargs)
+                    return custom_forward
+
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(decoder_layer),
+                    hidden_states,
+                    image_gen_indicators,
+                    indexes,
+                    attention_mask,
+                    use_reentrant=False,
+                )
+            else:
+                hidden_states = decoder_layer(
+                    hidden_states,
+                    image_gen_indicators=image_gen_indicators,
+                    indexes=indexes,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    num_gen_tokens=num_gen_tokens,
+                    **kwargs,
+                )
+
+        # Apply final norm based on token type (using slicing, not boolean index)
         if not exist_gen:
             hidden_states = self.norm(hidden_states)
         elif not exist_und:
             hidden_states = self.norm_mot_gen(hidden_states)
         else:
-            _hidden = hidden_states.new_zeros(hidden_states.shape)
-            _hidden[~image_gen_indicators] = self.norm(hidden_states[~image_gen_indicators])
-            _hidden[image_gen_indicators] = self.norm_mot_gen(hidden_states[image_gen_indicators])
-            hidden_states = _hidden
+            hidden_states = torch.cat([
+                self.norm_mot_gen(hidden_states[:, :num_gen_tokens, :]),
+                self.norm(hidden_states[:, num_gen_tokens:, :]),
+            ], dim=1)
+
+        # Unpack back to original token order
+        if inv_perm is not None:
+            hidden_states = hidden_states[:, inv_perm, :]
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -1010,7 +1243,7 @@ class NEOChatModel(PreTrainedModel):
     base_model_prefix = "language_model"
     _supports_flash_attn_2 = True
     supports_gradient_checkpointing = True
-    _no_split_modules = ["NEOVisionModel", "Qwen3DecoderLayer"]
+    _no_split_modules = ["Qwen3DecoderLayer"]
 
     def __init__(self, config: NEOChatConfig):
         super().__init__(config)
@@ -1019,6 +1252,11 @@ class NEOChatModel(PreTrainedModel):
         self.patch_size = patch_size
         self.template = config.template
         self.downsample_ratio = config.downsample_ratio
+
+        # Special token IDs (fixed for this tokenizer)
+        self.img_start_token_id = 151670   # <img>
+        self.img_end_token_id = 151671     # </img>
+        self.img_context_token_id = 151669 # <IMG_CONTEXT>
 
         # Vision encoder (understanding)
         self.vision_model = NEOVisionModel(config.vision_config)
@@ -1074,6 +1312,7 @@ class NEOChatModel(PreTrainedModel):
         self.noise_scale_mode = config.noise_scale_mode
         self.noise_scale_base_image_seq_len = config.noise_scale_base_image_seq_len
         self.noise_scale_max_value = config.noise_scale_max_value
+        self.timestep_shift = config.timestep_shift
         self.time_schedule = config.time_schedule
         self.time_shift_type = config.time_shift_type
         self.base_shift = config.base_shift
@@ -1083,6 +1322,10 @@ class NEOChatModel(PreTrainedModel):
         self.t_eps = config.t_eps
         self.P_mean = config.P_mean
         self.P_std = config.P_std
+
+    def _set_gradient_checkpointing(self, module, value=False):
+        if isinstance(module, Qwen3Model):
+            module.gradient_checkpointing = value
 
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
@@ -1109,136 +1352,204 @@ class NEOChatModel(PreTrainedModel):
         attention_mask=None,
         labels=None,
         pixel_values=None,
+        image_for_gen_flags=None,
         image_gen_indicators=None,
         indexes=None,
-        gen_pixel_values=None,
-        timesteps=None,
-        gen_grid_hw=None,
         grid_hw=None,
         **kwargs,
     ):
         """Training forward pass for SenseNova-U1.
 
-        Supports three modes depending on inputs:
-        1. Understanding only: input_ids + labels (+ optional pixel_values for VQA)
-        2. Generation only: input_ids + gen_pixel_values + timesteps
-        3. Mixed: both understanding and generation tokens in same batch
+        Aligned with official SenseNova-U1 training/sensenovavl implementation.
+        All images (understanding + generation) are passed as a single pixel_values tensor.
+        image_for_gen_flags marks which images are for generation.
 
-        Returns ModelOutput with .loss for VeOmni trainer compatibility.
+        Args:
+            input_ids: [1, S] token ids with IMG_CONTEXT placeholders
+            pixel_values: [N_total_patches, 3*p*p] all images patchified (ImageNet norm)
+            image_for_gen_flags: [N_images] bool, True = generation image
+            image_gen_indicators: [1, S] bool, marks generation token positions
+            grid_hw: [N_images, 2] patch grid dimensions per image
+            indexes: [S, 3] position ids (t, h, w) — or [3, S]
+            labels: [1, S] with -100 for non-CE positions
         """
         device = input_ids.device if input_ids is not None else next(self.parameters()).device
         batch_size = input_ids.shape[0] if input_ids is not None else 1
         seq_len = input_ids.shape[1] if input_ids is not None else 0
 
-        # Build 3D position IDs (t, h, w) if not provided
-        # indexes shape: [3, S] where row 0=temporal, 1=h, 2=w
-        # For text-only: t = sequential positions, h = 0, w = 0
-        if indexes is None:
-            t_ids = torch.arange(seq_len, device=device)
-            h_ids = torch.zeros(seq_len, dtype=torch.long, device=device)
-            w_ids = torch.zeros(seq_len, dtype=torch.long, device=device)
-            indexes = torch.stack([t_ids, h_ids, w_ids], dim=0)  # [3, S]
-
         # Embed input tokens
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Process understanding images (ViT features injected into sequence)
-        if pixel_values is not None:
-            vit_features = self.extract_feature(pixel_values, gen_model=False, grid_hw=grid_hw)
+        # Handle indexes: ensure shape [3, S] for RoPE (t, h, w)
+        if indexes is not None and indexes.dim() == 2 and indexes.shape[1] == 3 and indexes.shape[0] != 3:
+            indexes = indexes.T  # [S, 3] -> [3, S]
 
-        # Process generation images (noisy target for flow-matching loss)
-        # Official (SenseNova-U1 training/sensenovavl):
-        #   1. Create noise in pixel space, interpolate: z = t*x + (1-t)*noise
-        #   2. Merge patches: [h,w] -> [h/m, w/m] with m=merge_size
-        #   3. Pass noisy pixels through gen ViT -> features for LLM
-        #   4. fm_head predicts in merged pixel space
-        #   5. v = (x - z)/(1-t), pred_v = (pred_x - z_merged)/(1-t)
-        #   6. loss = MSE(pred_v, v)
+        # Process images and prepare generation targets
         fm_loss = None
-        image_gen_x = None
+        image_gen_v = None
         image_gen_z = None
         image_gen_t = None
-        if gen_pixel_values is not None and timesteps is not None and image_gen_indicators is not None:
+        vit_embeds = None
+        vit_embeds_gen = None
+
+        if pixel_values is not None and grid_hw is not None:
             merge_size = int(1 / self.downsample_ratio)
             patch_size = self.patch_size
+
+            if image_for_gen_flags is None:
+                image_for_gen_flags = torch.zeros(grid_hw.shape[0], dtype=torch.bool, device=device)
+
+            # Prepare generation targets (aligned with official prepare_image_gen_targets)
+            pixel_values_flat = pixel_values.view(-1, 3 * patch_size * patch_size)
+
+            # ImageNet denorm -> [0,1] -> [-1,1] for generation images
+            und_mean = torch.tensor([0.485, 0.456, 0.406], device=device, dtype=pixel_values_flat.dtype).view(1, 3, 1, 1)
+            und_std = torch.tensor([0.229, 0.224, 0.225], device=device, dtype=pixel_values_flat.dtype).view(1, 3, 1, 1)
+
+            pixel_values_updated = []
+            image_gen_x_list = []
+            image_gen_z_list = []
+            image_gen_t_list = []
+            image_gen_noise_scale_list = []
+
             ps_merged = patch_size * merge_size
+            image_token_accum = 0
 
-            noise = torch.randn_like(gen_pixel_values)
-            if self.noise_scale != 1.0:
-                noise = noise * self.noise_scale
+            for image_i in range(grid_hw.shape[0]):
+                cur_h = int(grid_hw[image_i, 0])
+                cur_w = int(grid_hw[image_i, 1])
+                cur_n = cur_h * cur_w
 
-            t = timesteps.view(-1, 1) if timesteps.dim() == 1 else timesteps
-            noisy_pixels = t * gen_pixel_values + (1 - t) * noise
+                if image_for_gen_flags[image_i]:
+                    cur_pv = pixel_values_flat[image_token_accum:image_token_accum + cur_n].clone()
+                    # Convert from ImageNet norm to [-1, 1] (reshape to [N,3,p,p] for correct channel-wise denorm)
+                    cur_pv = cur_pv.view(-1, 3, patch_size, patch_size)
+                    cur_pv = (cur_pv * und_std + und_mean).clamp(0, 1).view(-1, 3 * patch_size * patch_size)
+                    cur_pv = (cur_pv - 0.5) * 2
 
-            # Pass noisy pixels through gen ViT to get LLM-space features
-            gen_features = self.extract_feature(noisy_pixels, gen_model=True, grid_hw=gen_grid_hw)
+                    # Noise scale (resolution-dependent)
+                    image_seq_len = cur_n // (merge_size ** 2)
+                    noise_scale = self.noise_scale
+                    if hasattr(self, 'noise_scale_mode') and self.noise_scale_mode in ("resolution", "dynamic"):
+                        base = float(self.noise_scale_base_image_seq_len)
+                        scale = (image_seq_len / base) ** 0.5
+                        noise_scale = scale * float(self.noise_scale)
 
-            gen_mask = image_gen_indicators.bool()
-            if gen_mask.any():
-                flat_gen = gen_features.reshape(-1, gen_features.shape[-1])
-                num_gen_tokens = gen_mask.sum().item()
-                if flat_gen.shape[0] >= num_gen_tokens:
-                    inputs_embeds[gen_mask] = flat_gen[:num_gen_tokens]
+                    cur_noise = torch.randn_like(cur_pv) * noise_scale
 
-            # Merge pixel patches for FM target (pixel space, post-merge)
-            # gen_pixel_values: [N_patches, 3*p*p] -> merge into [N_merged, ps_merged^2*3]
-            def _merge_patches(pv, grid_hw_t):
-                merged = []
-                cur = 0
-                for i in range(grid_hw_t.shape[0]):
-                    h, w = int(grid_hw_t[i, 0]), int(grid_hw_t[i, 1])
-                    n = h * w
-                    img = pv[cur:cur + n].view(h, w, 3, patch_size, patch_size)
-                    img = img.view(h // merge_size, merge_size, w // merge_size, merge_size, 3, patch_size, patch_size)
-                    img = torch.einsum("h a w b c i j -> h w a i b j c", img).contiguous()
-                    img = img.view(-1, ps_merged ** 2 * 3)
-                    merged.append(img)
-                    cur += n
-                return torch.cat(merged, dim=0)
+                    # Sample timestep t from logit-normal
+                    u = torch.normal(mean=0.0, std=1.0, size=(1,), device=device) * self.P_std + self.P_mean
+                    t = (1 / (1 + torch.exp(-u))).to(dtype=pixel_values_flat.dtype, device=device)
+                    t = self._apply_time_schedule(t, image_seq_len)
 
-            image_gen_x = _merge_patches(gen_pixel_values, gen_grid_hw)
-            image_gen_z = _merge_patches(noisy_pixels, gen_grid_hw)
-            # Per-merged-token timesteps
-            num_merged = image_gen_x.shape[0]
-            image_gen_t = timesteps.expand(num_merged)
+                    t_expanded = t.expand(cur_n)
+                    t_expanded_merged = t.expand(image_seq_len)
 
-        # Add timestep + noise_scale embedding to generation token positions
-        if image_gen_t is not None and image_gen_indicators is not None:
-            gen_mask = image_gen_indicators.bool()
-            if gen_mask.any():
-                t_emb = self.fm_modules["timestep_embedder"](image_gen_t)
-                if self.add_noise_scale_embedding and "noise_scale_embedder" in self.fm_modules:
-                    ns_val = torch.full_like(image_gen_t, self.noise_scale / self.noise_scale_max_value)
-                    ns_emb = self.fm_modules["noise_scale_embedder"](ns_val)
-                    t_emb = t_emb + ns_emb
-                num_gen_tokens = gen_mask.sum().item()
-                if t_emb.shape[0] >= num_gen_tokens:
-                    inputs_embeds[gen_mask] = inputs_embeds[gen_mask] + t_emb[:num_gen_tokens]
+                    # Noisy interpolation: z = t*x + (1-t)*noise
+                    cur_z = t_expanded.view(-1, 1) * cur_pv + (1 - t_expanded.view(-1, 1)) * cur_noise
+                    pixel_values_updated.append(cur_z)
 
-        # Build 4D causal attention mask from 2D padding mask
-        # attention code expects [B, 1, S, S] additive mask (0 = attend, -inf = mask)
-        causal_mask = torch.triu(
-            torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=inputs_embeds.dtype),
-            diagonal=1,
-        )
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
-        if attention_mask is not None and attention_mask.dim() == 2:
-            # Combine with padding mask: masked positions (0) get -inf
-            pad_mask = attention_mask[:, None, None, :].to(inputs_embeds.dtype)
-            pad_mask = torch.where(pad_mask == 0, torch.tensor(float("-inf"), device=device, dtype=inputs_embeds.dtype), torch.zeros_like(pad_mask))
-            causal_mask = causal_mask + pad_mask
+                    image_gen_t_list.append(t_expanded_merged)
+                    image_gen_noise_scale_list.append(
+                        torch.full_like(t_expanded_merged, noise_scale / self.noise_scale_max_value)
+                    )
 
-        # Forward through language model (returns CausalLMOutputWithPast with .hidden_states)
+                    # Merge patches for FM target
+                    cur_pv_merged = cur_pv.view(cur_h // merge_size, merge_size, cur_w // merge_size, merge_size, 3, patch_size, patch_size)
+                    cur_pv_merged = torch.einsum("h a w b c i j -> h w a i b j c", cur_pv_merged).contiguous().view(-1, ps_merged ** 2 * 3)
+
+                    cur_z_merged = cur_z.view(cur_h // merge_size, merge_size, cur_w // merge_size, merge_size, 3, patch_size, patch_size)
+                    cur_z_merged = torch.einsum("h a w b c i j -> h w a i b j c", cur_z_merged).contiguous().view(-1, ps_merged ** 2 * 3)
+
+                    image_gen_x_list.append(cur_pv_merged)
+                    image_gen_z_list.append(cur_z_merged)
+                else:
+                    cur_pv = pixel_values_flat[image_token_accum:image_token_accum + cur_n]
+                    pixel_values_updated.append(cur_pv)
+
+                image_token_accum += cur_n
+
+            pixel_values_updated = torch.cat(pixel_values_updated, dim=0)
+
+            if image_gen_x_list:
+                image_gen_x = torch.cat(image_gen_x_list, dim=0)
+                image_gen_z = torch.cat(image_gen_z_list, dim=0)
+                image_gen_t = torch.cat(image_gen_t_list, dim=0)
+                image_gen_noise_scale = torch.cat(image_gen_noise_scale_list, dim=0)
+                # Target velocity
+                image_gen_v = (image_gen_x - image_gen_z) / (1 - image_gen_t.view(-1, 1)).clamp_min(self.t_eps)
+
+            # Extract features: und ViT on original, gen ViT on noised
+            vit_embeds = self.extract_feature(pixel_values_flat, gen_model=False, grid_hw=grid_hw)
+            vit_embeds_gen = self.extract_feature(pixel_values_updated, gen_model=True, grid_hw=grid_hw)
+
+            # Inject ViT embeddings into input_embeds (out-of-place for FSDP2 compatibility)
+            selected = (input_ids[0] == 151669)  # IMG_CONTEXT_ID
+            if selected.any() and image_gen_indicators is not None:
+                gen_flags_at_img = image_gen_indicators[0][selected].bool()
+                mixed = torch.where(gen_flags_at_img[:, None], vit_embeds_gen, vit_embeds)
+                # Out-of-place: clone and scatter to avoid in-place on FSDP-managed output
+                inputs_embeds = inputs_embeds.clone()
+                inputs_embeds[0, selected] = mixed
+
+            # Add timestep + noise_scale embedding at generation positions
+            if image_gen_t is not None and image_gen_indicators is not None:
+                gen_mask = image_gen_indicators[0].bool()
+                if gen_mask.any():
+                    t_emb = self.fm_modules["timestep_embedder"](image_gen_t)
+                    if self.add_noise_scale_embedding and "noise_scale_embedder" in self.fm_modules:
+                        ns_emb = self.fm_modules["noise_scale_embedder"](image_gen_noise_scale)
+                        t_emb = t_emb + ns_emb
+                    num_gen_tokens = gen_mask.sum().item()
+                    k = min(t_emb.shape[0], num_gen_tokens)
+                    gen_positions = gen_mask.nonzero(as_tuple=True)[0][:k]
+                    # Build additive tensor and add out-of-place
+                    t_add = torch.zeros_like(inputs_embeds[0])
+                    t_add[gen_positions] = t_emb[:k]
+                    inputs_embeds = inputs_embeds + t_add.unsqueeze(0)
+
+        elif pixel_values is None:
+            # Text-only: build default indexes if needed
+            pass
+
+        # Build indexes if not provided (expect [3, S] format for RoPE)
+        if indexes is None:
+            indexes = self.get_thw_indexes(input_ids[0], grid_hw)
+            # get_thw_indexes returns [3, S] — keep as-is
+
+        # Build flex_attention mask (aligned with official SenseNova-U1)
+        # When in mixed mode (gen + und), the mask will be rebuilt after packing
+        # inside Qwen3Model.forward — we pass _modality_indicators for that purpose.
+        flex_mask = None
+        padlen = 0
+        modality_indicators = None
+        _use_flex = os.environ.get("USE_FLEX_ATTN", "1") == "1"
+        if self.training and _HAS_FLEX_ATTN and image_gen_indicators is not None and _use_flex:
+            modality_indicators = _build_modality_indicators_from_input_ids(
+                input_ids[0], self.img_start_token_id, self.img_context_token_id
+            )
+            # Build initial mask (will be rebuilt on packed order inside Qwen3Model)
+            flex_mask, padlen = _build_flex_mask_for_training(
+                modality_indicators=modality_indicators,
+                image_gen_indicators=image_gen_indicators[0],
+                seq_len=seq_len,
+                device=device,
+            )
+
+        # Forward through language model
         outputs = self.language_model(
             inputs_embeds=inputs_embeds,
             image_gen_indicators=image_gen_indicators,
             indexes=indexes,
-            attention_mask=causal_mask,
+            attention_mask=None,
             use_cache=False,
+            flex_mask=flex_mask,
+            padlen=padlen,
+            _modality_indicators=modality_indicators,
         )
         hidden_states = outputs.hidden_states
 
-        # CE loss for understanding tokens
+        # CE loss
         ce_loss = None
         if labels is not None:
             logits = self.language_model.lm_head(hidden_states)
@@ -1250,20 +1561,15 @@ class NEOChatModel(PreTrainedModel):
                 ignore_index=-100,
             )
 
-        # Flow-matching loss for generation tokens
-        # Official: pred_x = fm_head(hidden), pred_v = (pred_x - z)/(1-t),
-        #           target_v = (x - z)/(1-t), loss = MSE(pred_v, target_v)
-        if image_gen_x is not None and image_gen_z is not None and image_gen_t is not None:
-            gen_mask = image_gen_indicators.bool()
-            if gen_mask.any():
-                gen_hidden = hidden_states[gen_mask]
+        # Flow-matching loss (aligned with official)
+        if image_gen_v is not None and image_gen_z is not None and image_gen_t is not None:
+            gen_mask = image_gen_indicators[0].bool() if image_gen_indicators is not None else None
+            if gen_mask is not None and gen_mask.any():
+                gen_hidden = hidden_states[0, gen_mask]
                 fm_pred_x = self.fm_modules["fm_head"](gen_hidden)
-                num_gen = min(fm_pred_x.shape[0], image_gen_x.shape[0])
-                t_col = image_gen_t[:num_gen].view(-1, 1)
-                denom = (1 - t_col).clamp_min(self.t_eps)
-                pred_v = (fm_pred_x[:num_gen] - image_gen_z[:num_gen]) / denom
-                target_v = (image_gen_x[:num_gen] - image_gen_z[:num_gen]) / denom
-                fm_loss = torch.nn.functional.mse_loss(pred_v, target_v)
+                k = min(fm_pred_x.shape[0], image_gen_x.shape[0])
+                pred_v = (fm_pred_x[:k] - image_gen_z[:k]) / (1 - image_gen_t[:k].view(-1, 1)).clamp_min(self.t_eps)
+                fm_loss = torch.nn.functional.mse_loss(pred_v, image_gen_v[:k])
 
         # Combine losses
         loss = None
@@ -1274,11 +1580,14 @@ class NEOChatModel(PreTrainedModel):
             if fm_loss is not None:
                 loss = loss + fm_loss
 
-        return CausalLMOutputWithPast(
+        output = CausalLMOutputWithPast(
             loss=loss,
             logits=self.language_model.lm_head(hidden_states) if labels is None else None,
             hidden_states=hidden_states,
         )
+        output.ce_loss = ce_loss
+        output.fm_loss = fm_loss
+        return output
 
     # ------------------------------------------------------------------
     # Generation inference helpers
@@ -1305,10 +1614,31 @@ class NEOChatModel(PreTrainedModel):
         x = torch.einsum("nhwpqc->nchpwq", x)
         return x.reshape(x.shape[0], 3, h * patch_size, w * patch_size)
 
-    def _apply_time_schedule(self, t: torch.Tensor, image_seq_len: int, timestep_shift: float) -> torch.Tensor:
+    def _calculate_dynamic_mu(self, image_seq_len: int) -> float:
+        denom = self.max_image_seq_len - self.base_image_seq_len
+        if denom == 0:
+            return float(self.base_shift)
+        m = (self.max_shift - self.base_shift) / denom
+        b = self.base_shift - m * self.base_image_seq_len
+        return float(image_seq_len) * m + b
+
+    def _apply_time_schedule(self, t: torch.Tensor, image_seq_len: int, timestep_shift: float = None) -> torch.Tensor:
         sigma = 1 - t
-        shift = timestep_shift
-        sigma = shift * sigma / (1 + (shift - 1) * sigma)
+        if self.time_schedule == "standard":
+            shift = timestep_shift if timestep_shift is not None else self.timestep_shift
+            sigma = shift * sigma / (1 + (shift - 1) * sigma)
+        elif self.time_schedule == "dynamic":
+            mu = self._calculate_dynamic_mu(image_seq_len)
+            mu_t = t.new_tensor(mu)
+            if self.time_shift_type == "exponential":
+                shift = torch.exp(mu_t)
+                sigma = shift * sigma / (1 + (shift - 1) * sigma)
+            elif self.time_shift_type == "linear":
+                sigma = mu_t / (mu_t + (1 / sigma - 1))
+            else:
+                raise ValueError(f"Unsupported time_shift_type: {self.time_shift_type}")
+        else:
+            raise ValueError(f"Unsupported time_schedule: {self.time_schedule}")
         return 1 - sigma
 
     def _build_t2i_query(self, prompt_text, system_message=None, append_text=None):

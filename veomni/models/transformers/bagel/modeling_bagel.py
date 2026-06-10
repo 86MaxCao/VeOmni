@@ -62,6 +62,7 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_freq = t_freq.to(dtype=next(self.mlp.parameters()).dtype)
         return self.mlp(t_freq)
 
 
@@ -632,7 +633,7 @@ class PackedAttention(nn.Module):
             self.q_norm = nn.Identity()
             self.k_norm = nn.Identity()
 
-    def forward(self, packed_sequence, sample_lens, packed_position_embeddings):
+    def forward(self, packed_sequence, sample_lens, packed_position_embeddings, attention_mask=None):
         packed_query_states = self.q_proj(packed_sequence).view(-1, self.num_heads, self.head_dim)
         packed_key_states = self.k_proj(packed_sequence).view(-1, self.num_key_value_heads, self.head_dim)
         packed_value_states = self.v_proj(packed_sequence).view(-1, self.num_key_value_heads, self.head_dim)
@@ -645,44 +646,63 @@ class PackedAttention(nn.Module):
             packed_query_states, packed_key_states, cos, sin
         )
 
-        try:
-            from flash_attn import flash_attn_varlen_func
-            cu_seqlens = torch.nn.functional.pad(
-                torch.cumsum(torch.tensor(sample_lens, device=packed_sequence.device, dtype=torch.int32), dim=0),
-                (1, 0),
-            ).to(torch.int32)
-            max_seqlen = max(sample_lens)
-
-            attn_output = flash_attn_varlen_func(
-                packed_query_states.to(torch.bfloat16),
-                packed_key_states.to(torch.bfloat16),
-                packed_value_states.to(torch.bfloat16),
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                causal=True,
-            )
-        except ImportError:
-            # Fallback: per-sample SDPA
-            packed_key_states_expanded = packed_key_states[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
-            packed_key_states_expanded = packed_key_states_expanded.reshape(-1, self.num_heads, self.head_dim)
-            packed_value_states_expanded = packed_value_states[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
-            packed_value_states_expanded = packed_value_states_expanded.reshape(-1, self.num_heads, self.head_dim)
+        if isinstance(attention_mask, list):
+            packed_key_states = packed_key_states[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
+            packed_key_states = packed_key_states.reshape(-1, self.num_heads, self.head_dim)
+            packed_value_states = packed_value_states[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
+            packed_value_states = packed_value_states.reshape(-1, self.num_heads, self.head_dim)
 
             q_split = packed_query_states.transpose(0, 1).split(sample_lens, dim=1)
-            k_split = packed_key_states_expanded.transpose(0, 1).split(sample_lens, dim=1)
-            v_split = packed_value_states_expanded.transpose(0, 1).split(sample_lens, dim=1)
+            k_split = packed_key_states.transpose(0, 1).split(sample_lens, dim=1)
+            v_split = packed_value_states.transpose(0, 1).split(sample_lens, dim=1)
             outputs = []
-            for qi, ki, vi in zip(q_split, k_split, v_split):
+            for qi, ki, vi, mask_i in zip(q_split, k_split, v_split, attention_mask):
                 o = F.scaled_dot_product_attention(
                     qi.unsqueeze(0).to(torch.bfloat16),
                     ki.unsqueeze(0).to(torch.bfloat16),
                     vi.unsqueeze(0).to(torch.bfloat16),
-                    is_causal=True,
+                    attn_mask=mask_i.to(torch.bfloat16).unsqueeze(0),
                 )
                 outputs.append(o.squeeze(0))
             attn_output = torch.cat(outputs, dim=1).transpose(0, 1)
+        else:
+            try:
+                from flash_attn import flash_attn_varlen_func
+                cu_seqlens = torch.nn.functional.pad(
+                    torch.cumsum(torch.tensor(sample_lens, device=packed_sequence.device, dtype=torch.int32), dim=0),
+                    (1, 0),
+                ).to(torch.int32)
+                max_seqlen = max(sample_lens)
+
+                attn_output = flash_attn_varlen_func(
+                    packed_query_states.to(torch.bfloat16),
+                    packed_key_states.to(torch.bfloat16),
+                    packed_value_states.to(torch.bfloat16),
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                    causal=True,
+                )
+            except ImportError:
+                packed_key_states_expanded = packed_key_states[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
+                packed_key_states_expanded = packed_key_states_expanded.reshape(-1, self.num_heads, self.head_dim)
+                packed_value_states_expanded = packed_value_states[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
+                packed_value_states_expanded = packed_value_states_expanded.reshape(-1, self.num_heads, self.head_dim)
+
+                q_split = packed_query_states.transpose(0, 1).split(sample_lens, dim=1)
+                k_split = packed_key_states_expanded.transpose(0, 1).split(sample_lens, dim=1)
+                v_split = packed_value_states_expanded.transpose(0, 1).split(sample_lens, dim=1)
+                outputs = []
+                for qi, ki, vi in zip(q_split, k_split, v_split):
+                    o = F.scaled_dot_product_attention(
+                        qi.unsqueeze(0).to(torch.bfloat16),
+                        ki.unsqueeze(0).to(torch.bfloat16),
+                        vi.unsqueeze(0).to(torch.bfloat16),
+                        is_causal=True,
+                    )
+                    outputs.append(o.squeeze(0))
+                attn_output = torch.cat(outputs, dim=1).transpose(0, 1)
 
         attn_output = attn_output.reshape(-1, self.hidden_size)
         return self.o_proj(attn_output)
@@ -796,6 +816,7 @@ class PackedAttentionMoT(nn.Module):
         packed_position_embeddings,
         packed_und_token_indexes,
         packed_gen_token_indexes,
+        attention_mask=None,
     ):
         seq_len = packed_sequence.shape[0]
         packed_query_states = packed_sequence.new_zeros((seq_len, self.num_heads * self.head_dim))
@@ -816,7 +837,6 @@ class PackedAttentionMoT(nn.Module):
         packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
         packed_value_states = packed_value_states.view(-1, self.num_key_value_heads, self.head_dim)
 
-        # Apply separate QK norms
         q_normed = packed_query_states.new_zeros(packed_query_states.shape)
         k_normed = packed_key_states.new_zeros(packed_key_states.shape)
         q_normed[packed_und_token_indexes] = self.q_norm(packed_query_states[packed_und_token_indexes])
@@ -827,43 +847,62 @@ class PackedAttentionMoT(nn.Module):
         cos, sin = packed_position_embeddings
         q_normed, k_normed = _apply_rotary_pos_emb(q_normed, k_normed, cos, sin)
 
-        try:
-            from flash_attn import flash_attn_varlen_func
-            cu_seqlens = torch.nn.functional.pad(
-                torch.cumsum(torch.tensor(sample_lens, device=packed_sequence.device, dtype=torch.int32), dim=0),
-                (1, 0),
-            ).to(torch.int32)
-            max_seqlen = max(sample_lens)
-            attn_output = flash_attn_varlen_func(
-                q_normed.to(torch.bfloat16),
-                k_normed.to(torch.bfloat16),
-                packed_value_states.to(torch.bfloat16),
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                causal=True,
-            )
-        except ImportError:
-            # Fallback SDPA
-            packed_key_states_expanded = k_normed[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
-            packed_key_states_expanded = packed_key_states_expanded.reshape(-1, self.num_heads, self.head_dim)
-            packed_value_states_expanded = packed_value_states[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
-            packed_value_states_expanded = packed_value_states_expanded.reshape(-1, self.num_heads, self.head_dim)
+        if isinstance(attention_mask, list):
+            k_normed = k_normed[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
+            k_normed = k_normed.reshape(-1, self.num_heads, self.head_dim)
+            packed_value_states = packed_value_states[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
+            packed_value_states = packed_value_states.reshape(-1, self.num_heads, self.head_dim)
 
             q_split = q_normed.transpose(0, 1).split(sample_lens, dim=1)
-            k_split = packed_key_states_expanded.transpose(0, 1).split(sample_lens, dim=1)
-            v_split = packed_value_states_expanded.transpose(0, 1).split(sample_lens, dim=1)
+            k_split = k_normed.transpose(0, 1).split(sample_lens, dim=1)
+            v_split = packed_value_states.transpose(0, 1).split(sample_lens, dim=1)
             outputs = []
-            for qi, ki, vi in zip(q_split, k_split, v_split):
+            for qi, ki, vi, mask_i in zip(q_split, k_split, v_split, attention_mask):
                 o = F.scaled_dot_product_attention(
                     qi.unsqueeze(0).to(torch.bfloat16),
                     ki.unsqueeze(0).to(torch.bfloat16),
                     vi.unsqueeze(0).to(torch.bfloat16),
-                    is_causal=True,
+                    attn_mask=mask_i.to(torch.bfloat16).unsqueeze(0),
                 )
                 outputs.append(o.squeeze(0))
             attn_output = torch.cat(outputs, dim=1).transpose(0, 1)
+        else:
+            try:
+                from flash_attn import flash_attn_varlen_func
+                cu_seqlens = torch.nn.functional.pad(
+                    torch.cumsum(torch.tensor(sample_lens, device=packed_sequence.device, dtype=torch.int32), dim=0),
+                    (1, 0),
+                ).to(torch.int32)
+                max_seqlen = max(sample_lens)
+                attn_output = flash_attn_varlen_func(
+                    q_normed.to(torch.bfloat16),
+                    k_normed.to(torch.bfloat16),
+                    packed_value_states.to(torch.bfloat16),
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                    causal=True,
+                )
+            except ImportError:
+                packed_key_states_expanded = k_normed[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
+                packed_key_states_expanded = packed_key_states_expanded.reshape(-1, self.num_heads, self.head_dim)
+                packed_value_states_expanded = packed_value_states[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
+                packed_value_states_expanded = packed_value_states_expanded.reshape(-1, self.num_heads, self.head_dim)
+
+                q_split = q_normed.transpose(0, 1).split(sample_lens, dim=1)
+                k_split = packed_key_states_expanded.transpose(0, 1).split(sample_lens, dim=1)
+                v_split = packed_value_states_expanded.transpose(0, 1).split(sample_lens, dim=1)
+                outputs = []
+                for qi, ki, vi in zip(q_split, k_split, v_split):
+                    o = F.scaled_dot_product_attention(
+                        qi.unsqueeze(0).to(torch.bfloat16),
+                        ki.unsqueeze(0).to(torch.bfloat16),
+                        vi.unsqueeze(0).to(torch.bfloat16),
+                        is_causal=True,
+                    )
+                    outputs.append(o.squeeze(0))
+                attn_output = torch.cat(outputs, dim=1).transpose(0, 1)
 
         attn_output = attn_output.reshape(-1, self.num_heads * self.head_dim)
         output = attn_output.new_zeros((seq_len, self.hidden_size))
@@ -982,10 +1021,11 @@ class Qwen2DecoderLayer(nn.Module):
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, packed_sequence, sample_lens, packed_position_embeddings, **kwargs):
+    def forward(self, packed_sequence, sample_lens, packed_position_embeddings, attention_mask=None, **kwargs):
         residual = packed_sequence
         packed_sequence = self.self_attn(
             self.input_layernorm(packed_sequence), sample_lens, packed_position_embeddings,
+            attention_mask=attention_mask,
         )
         packed_sequence = residual + packed_sequence
         residual = packed_sequence
@@ -1047,6 +1087,7 @@ class Qwen2MoTDecoderLayer(nn.Module):
         packed_position_embeddings,
         packed_und_token_indexes,
         packed_gen_token_indexes,
+        attention_mask=None,
     ):
         residual = packed_sequence
         normed = packed_sequence.new_zeros(packed_sequence.shape)
@@ -1056,6 +1097,7 @@ class Qwen2MoTDecoderLayer(nn.Module):
         attn_out = self.self_attn(
             normed, sample_lens, packed_position_embeddings,
             packed_und_token_indexes, packed_gen_token_indexes,
+            attention_mask=attention_mask,
         )
         packed_sequence = residual + attn_out
 
@@ -1146,6 +1188,7 @@ class Qwen2Model(nn.Module):
         if self.use_moe:
             self.norm_moe_gen = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen2RotaryEmbedding(config)
+        self.gradient_checkpointing = False
 
     def forward(
         self,
@@ -1170,7 +1213,27 @@ class Qwen2Model(nn.Module):
             )
 
         for layer in self.layers:
-            packed_sequence = layer(packed_sequence, sample_lens, packed_position_embeddings, **extra)
+            if self.gradient_checkpointing and self.training:
+                if self.use_moe:
+                    packed_sequence = self._gradient_checkpointing_func(
+                        layer.__call__,
+                        packed_sequence,
+                        sample_lens,
+                        packed_position_embeddings,
+                        packed_und_token_indexes,
+                        packed_gen_token_indexes,
+                        attention_mask=attention_mask,
+                    )
+                else:
+                    packed_sequence = self._gradient_checkpointing_func(
+                        layer.__call__,
+                        packed_sequence,
+                        sample_lens,
+                        packed_position_embeddings,
+                        attention_mask=attention_mask,
+                    )
+            else:
+                packed_sequence = layer(packed_sequence, sample_lens, packed_position_embeddings, attention_mask=attention_mask, **extra)
 
         if self.use_moe:
             out = torch.zeros_like(packed_sequence)
@@ -1292,6 +1355,7 @@ class BagelOutput(ModelOutput):
     loss: Optional[torch.FloatTensor] = None
     mse_loss: Optional[torch.FloatTensor] = None
     ce_loss: Optional[torch.FloatTensor] = None
+    logits: Optional[torch.FloatTensor] = None
 
 
 class BagelForConditionalGeneration(PreTrainedModel):
@@ -1337,6 +1401,12 @@ class BagelForConditionalGeneration(PreTrainedModel):
             self.get_flattened_position_ids = _get_flattened_position_ids_extrapolate
 
         self._init_gen_weights()
+        self.post_init()
+
+    def _set_gradient_checkpointing(self, enable=True, gradient_checkpointing_func=None):
+        self.language_model.model.gradient_checkpointing = enable
+        if gradient_checkpointing_func is not None:
+            self.language_model.model._gradient_checkpointing_func = gradient_checkpointing_func
 
     def _init_gen_weights(self):
         if self.config.visual_gen:
@@ -1371,15 +1441,18 @@ class BagelForConditionalGeneration(PreTrainedModel):
         packed_vae_token_indexes: Optional[torch.LongTensor] = None,
         packed_timesteps: Optional[torch.LongTensor] = None,
         mse_loss_indexes: Optional[torch.BoolTensor] = None,
+        return_logits: bool = False,
         **kwargs,
     ) -> BagelOutput:
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        model_dtype = packed_text_embedding.dtype
         packed_sequence = packed_text_embedding.new_zeros(size=(sequence_length, self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
         attention_mask = nested_attention_masks
 
         if self.config.visual_und and packed_vit_tokens is not None:
+            packed_vit_tokens = packed_vit_tokens.to(dtype=model_dtype)
             cu_seqlens = F.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0)).to(torch.int32)
             max_seqlen = torch.max(vit_token_seqlens).item()
             packed_vit_token_embed = self.vit_model(
@@ -1396,6 +1469,8 @@ class BagelForConditionalGeneration(PreTrainedModel):
             packed_sequence[packed_vit_token_indexes] = packed_vit_token_embed
 
         if self.config.visual_gen and padded_latent is not None:
+            padded_latent = padded_latent.to(dtype=model_dtype)
+            packed_timesteps = packed_timesteps.to(dtype=model_dtype)
             p = self.latent_patch_size
             packed_latent = []
             for latent, (h, w) in zip(padded_latent, patchified_vae_latent_shapes):
@@ -1440,7 +1515,7 @@ class BagelForConditionalGeneration(PreTrainedModel):
             packed_mse_preds = self.llm2vae(last_hidden_state[mse_loss_indexes])
             target = noise - packed_latent_clean
             has_mse = packed_timesteps > 0
-            mse_loss = (packed_mse_preds - target[has_mse]).pow(2).mean()
+            mse_loss = (packed_mse_preds - target[has_mse]) ** 2
 
         ce_loss = None
         if ce_loss_indexes is not None:
@@ -1448,17 +1523,16 @@ class BagelForConditionalGeneration(PreTrainedModel):
             if getattr(self.config, "freeze_und", False):
                 ce_hidden = ce_hidden.detach()
             packed_ce_preds = self.language_model.lm_head(ce_hidden)
-            ce_loss = F.cross_entropy(packed_ce_preds, packed_label_ids)
+            ce_loss = F.cross_entropy(packed_ce_preds, packed_label_ids, reduction="none")
 
         loss = None
-        if mse_loss is not None or ce_loss is not None:
-            loss = torch.tensor(0.0, device=packed_text_ids.device)
-            if mse_loss is not None:
-                loss = loss + mse_loss
-            if ce_loss is not None:
-                loss = loss + ce_loss
 
-        return BagelOutput(loss=loss, mse_loss=mse_loss, ce_loss=ce_loss)
+        logits = None
+        if return_logits:
+            text_hidden = last_hidden_state[packed_text_indexes]
+            logits = self.language_model.lm_head(text_hidden).unsqueeze(0)
+
+        return BagelOutput(loss=loss, mse_loss=mse_loss, ce_loss=ce_loss, logits=logits)
 
     # =========================================================================
     # Three-step KV-cache inference methods
