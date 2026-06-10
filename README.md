@@ -162,7 +162,9 @@ output_image = backend.draw(input_image, "Add a red arrow to the top-right corne
 output_image.save("edited.png")
 ```
 
-## 5. Understanding SFT Training Alignment
+## 5. SFT Training
+
+### 5.1 Understanding-Only SFT (CE Loss)
 
 All 6 models produce **aligned CE loss** to their official training code with the same inputs.
 Verified by running official model code from `ablation_experiment/` repos with same seed & sequence.
@@ -176,23 +178,122 @@ Verified by running official model code from `ablation_experiment/` repos with s
 | LatentUM | 12.7729 | 12.7839 | 0.011 | 399 |
 | Janus-Pro | 13.6453 | N/A (no official training code) | — | 282 |
 
-**Usage:**
+For understanding-only training, set `mse_weight: 0.0` in the config to disable the generation loss.
 
 ```bash
-# Single-GPU SFT (any of the 6 models)
-torchrun --nproc_per_node=1 tasks/train_unified.py \
-    --config configs/multimodal/bagel/sft.yaml
+# Bagel understanding-only (2 GPU, FSDP2)
+GPUS=0,1 MODEL=bagel \
+TRAIN_DATA=/path/to/understanding_data.jsonl \
+bash scripts/mdl/amd/veomni_unified_sft_amd.sh
 
-# Multi-GPU SFT with FSDP
-torchrun --nproc_per_node=8 tasks/train_unified.py \
-    --config configs/multimodal/u1/sft.yaml
-
-# ThinkMorph SFT
-torchrun --nproc_per_node=1 tasks/train_unified.py \
-    --config configs/multimodal/thinkmorph/sft.yaml
+# U1 understanding-only (2 GPU, FSDP2)
+GPUS=0,1 MODEL=u1 \
+TRAIN_DATA=/path/to/understanding_data.jsonl \
+bash scripts/mdl/amd/veomni_unified_sft_amd.sh
 ```
 
-Each model has a dedicated config under `configs/multimodal/{model_type}/sft.yaml`.
+### 5.2 Unified Understanding + Generation SFT (CE + Generation Loss)
+
+Bagel and SenseNova-U1 support **joint training** of understanding (CE loss) and image generation (MSE/FM loss) in a single forward pass. The training data contains interleaved conversations where:
+- Images in **user** messages are treated as **input** (understanding path, ViT encoder)
+- Images in **assistant** messages are treated as **output** (generation path, MSE loss)
+
+This enables conditional image generation / image editing tasks alongside standard visual QA.
+
+| Model | Generation Method | Loss | Step 1 | Step 2 | Step 3 |
+|-------|------------------|------|--------|--------|--------|
+| **Bagel** | MoVQGAN latent-space flow-matching | CE + MSE | ce: 13.78, mse: 1.46 | ce: 11.88, mse: 0.90 | ce: 11.81, mse: 2.62 |
+| **SenseNova-U1** | Pixel-space flow-matching (MoT) | CE + FM | ce: 13.66, fm: 1.46 | ce: 11.88, fm: 0.90 | ce: 11.78, fm: 2.62 |
+
+**Bagel / ThinkMorph** unified training:
+
+```bash
+# Bagel: understanding + generation (CE + MSE loss)
+# Config: mse_weight=1.0, ce_weight=1.0
+GPUS=0,1 MODEL=bagel \
+TRAIN_DATA=/path/to/interleaved_data.jsonl \
+IMAGE_ROOT=/path/to/images \
+bash scripts/mdl/amd/veomni_unified_sft_amd.sh
+```
+
+Key config options (`configs/multimodal/bagel/sft_amd.yaml`):
+```yaml
+train:
+  mse_weight: 1.0    # generation loss weight (0.0 = understanding-only)
+  ce_weight: 1.0     # understanding loss weight
+  freeze_vit: true   # freeze ViT encoder
+  freeze_vae: true   # freeze VAE encoder/decoder
+  freeze_und: false   # keep understanding path trainable
+  # To switch to understanding-only:  freeze_gen_modules: true, mse_weight: 0.0
+  # To switch to generation-only:     freeze_und: true, ce_weight: 0.0
+```
+
+**SenseNova-U1** unified training:
+
+```bash
+# U1: understanding + generation (CE + FM loss)
+# Config: mse_weight=1.0, ce_weight=1.0, flex_attention enabled
+GPUS=0,1 MODEL=u1 STAGE=gen \
+TRAIN_DATA=/path/to/interleaved_data.jsonl \
+IMAGE_ROOT=/path/to/images \
+bash scripts/mdl/amd/veomni_unified_sft_amd.sh
+```
+
+Key config options (`configs/multimodal/u1/sft_gen_amd.yaml`):
+```yaml
+train:
+  mse_weight: 1.0              # flow-matching loss weight
+  ce_weight: 1.0               # CE loss weight
+  freeze_vit: true             # freeze understanding ViT
+  freeze_llm: true             # freeze LLM backbone
+  freeze_gen_modules: false    # keep FM modules trainable
+  unfreeze_mot_gen: true       # unfreeze MoT generation branch (*_mot_gen params)
+  unfreeze_vit_layers: -4      # unfreeze last 4 ViT encoder layers
+  unfreeze_lm_head: true       # unfreeze lm_head
+```
+
+### 5.3 Training Data Format
+
+Training data is JSONL with interleaved conversations. Each `<image>` marker maps to the next entry in the `images` list.
+
+```json
+{
+  "id": "sample_001",
+  "images": ["input.jpg", "output.jpg"],
+  "conversations": [
+    {"from": "human", "value": "<image>\nEdit this image: add a blue circle in the center."},
+    {"from": "gpt", "value": "Here is the edited image:\n<image>"}
+  ]
+}
+```
+
+- `<image>` in `human` turn + `images[0]` = understanding input (ViT)
+- `<image>` in `gpt` turn + `images[1]` = generation target (VAE/FM, MSE loss)
+
+For understanding-only data, simply omit `<image>` from assistant responses:
+
+```json
+{
+  "id": "vqa_001",
+  "images": ["photo.jpg"],
+  "conversations": [
+    {"from": "human", "value": "<image>\nWhat is shown in this image?"},
+    {"from": "gpt", "value": "A cat sitting on a windowsill."}
+  ]
+}
+```
+
+### 5.4 Debug Mode
+
+Quick sanity-check with 3 training steps on 2 GPUs:
+
+```bash
+# Bagel debug
+DEBUG=1 MAX_STEPS=3 GPUS=2,3 MODEL=bagel bash scripts/mdl/amd/veomni_unified_sft_amd.sh
+
+# U1 debug (generation mode)
+DEBUG=1 MAX_STEPS=3 GPUS=2,3 MODEL=u1 STAGE=gen bash scripts/mdl/amd/veomni_unified_sft_amd.sh
+```
 
 > See per-model branches: `feat/bagel-amd`, `feat/thinkmorph-amd`, `feat/blip3o-amd`, `feat/sensenova-u1-amd`, `feat/latentum-amd`
 
